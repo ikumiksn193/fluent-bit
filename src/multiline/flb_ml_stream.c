@@ -327,6 +327,167 @@ void flb_ml_stream_id_destroy_all(struct flb_ml *ml, uint64_t stream_id)
     }
 }
 
+static int stream_group_has_pending(struct flb_ml_stream_group *group)
+{
+    if (flb_sds_len(group->buf) > 0 || group->mp_sbuf.size > 0) {
+        return FLB_TRUE;
+    }
+
+    return FLB_FALSE;
+}
+
+static int stream_has_pending(struct flb_ml_stream *mst)
+{
+    struct mk_list *head;
+    struct flb_ml_stream_group *group;
+
+    mk_list_foreach(head, &mst->groups) {
+        group = mk_list_entry(head, struct flb_ml_stream_group, _head);
+        if (stream_group_has_pending(group) == FLB_TRUE) {
+            return FLB_TRUE;
+        }
+    }
+
+    return FLB_FALSE;
+}
+
+/* Move every group of 'src' to the tail of 'dst', keeping their order */
+static void stream_groups_move(struct flb_ml_stream *src,
+                               struct flb_ml_stream *dst)
+{
+    struct mk_list *tmp;
+    struct mk_list *head;
+    struct flb_ml_stream_group *group;
+
+    mk_list_foreach_safe(head, tmp, &src->groups) {
+        group = mk_list_entry(head, struct flb_ml_stream_group, _head);
+        mk_list_del(&group->_head);
+        mk_list_add(&group->_head, &dst->groups);
+        group->stream = dst;
+    }
+}
+
+/*
+ * Returns FLB_TRUE if any stream registered with 'stream_id' holds data
+ * that has not been flushed yet (e.g. the first part of a multiline
+ * message waiting for its continuation).
+ */
+int flb_ml_stream_id_has_pending(struct flb_ml *ml, uint64_t stream_id)
+{
+    struct mk_list *head;
+    struct mk_list *head_group;
+    struct flb_ml_group *group;
+    struct flb_ml_stream *mst;
+    struct flb_ml_parser_ins *parser_i;
+
+    mk_list_foreach(head, &ml->groups) {
+        group = mk_list_entry(head, struct flb_ml_group, _head);
+        mk_list_foreach(head_group, &group->parsers) {
+            parser_i = mk_list_entry(head_group, struct flb_ml_parser_ins, _head);
+            mst = flb_ml_stream_get(parser_i, stream_id);
+            if (mst && stream_has_pending(mst) == FLB_TRUE) {
+                return FLB_TRUE;
+            }
+        }
+    }
+
+    return FLB_FALSE;
+}
+
+/*
+ * Hand over the pending state of 'src_stream_id' to 'dst_stream_id' so the
+ * next records appended to the destination continue the message that was
+ * started on the source. The destination must not hold pending data.
+ *
+ * The groups of both streams are exchanged instead of copying the buffers,
+ * so the source keeps a set of empty groups and can be destroyed later
+ * without flushing anything. Stream ids, names and flush callbacks are not
+ * changed: each stream keeps reporting to its own owner.
+ *
+ * Returns 0 on success or -1 if the destination already holds pending data
+ * or if both ids are equal.
+ */
+int flb_ml_stream_id_move_pending(struct flb_ml *ml,
+                                  uint64_t src_stream_id,
+                                  uint64_t dst_stream_id)
+{
+    struct mk_list *head;
+    struct mk_list *head_group;
+    struct flb_ml_group *group;
+    struct flb_ml_stream *src;
+    struct flb_ml_stream *dst;
+    struct flb_ml_stream_group *last_group;
+    struct flb_ml_stream tmp_stream;
+    struct flb_ml_parser_ins *parser_i;
+
+    if (src_stream_id == dst_stream_id) {
+        return -1;
+    }
+
+    if (flb_ml_stream_id_has_pending(ml, dst_stream_id) == FLB_TRUE) {
+        return -1;
+    }
+
+    mk_list_foreach(head, &ml->groups) {
+        group = mk_list_entry(head, struct flb_ml_group, _head);
+        mk_list_foreach(head_group, &group->parsers) {
+            parser_i = mk_list_entry(head_group, struct flb_ml_parser_ins, _head);
+
+            src = flb_ml_stream_get(parser_i, src_stream_id);
+            dst = flb_ml_stream_get(parser_i, dst_stream_id);
+            if (!src || !dst) {
+                continue;
+            }
+
+            /* swap the group lists: dst <- src, src <- old dst */
+            mk_list_init(&tmp_stream.groups);
+            stream_groups_move(dst, &tmp_stream);
+            stream_groups_move(src, dst);
+            stream_groups_move(&tmp_stream, src);
+
+            last_group = dst->last_stream_group;
+            dst->last_stream_group = src->last_stream_group;
+            src->last_stream_group = last_group;
+        }
+    }
+
+    return 0;
+}
+
+/*
+ * Keep the pending data of every stream registered with 'stream_id' out of
+ * the timer based flushes while 'hold' is FLB_TRUE. Explicit flushes and
+ * the destruction of the stream still flush it. Used by a caller that knows
+ * the continuation of a message is on its way from another source, e.g. the
+ * file that replaced a rotated file.
+ *
+ * Returns the number of streams updated.
+ */
+int flb_ml_stream_id_set_flush_hold(struct flb_ml *ml, uint64_t stream_id,
+                                    int hold)
+{
+    int count = 0;
+    struct mk_list *head;
+    struct mk_list *head_group;
+    struct flb_ml_group *group;
+    struct flb_ml_stream *mst;
+    struct flb_ml_parser_ins *parser_i;
+
+    mk_list_foreach(head, &ml->groups) {
+        group = mk_list_entry(head, struct flb_ml_group, _head);
+        mk_list_foreach(head_group, &group->parsers) {
+            parser_i = mk_list_entry(head_group, struct flb_ml_parser_ins, _head);
+            mst = flb_ml_stream_get(parser_i, stream_id);
+            if (mst) {
+                mst->flush_hold = hold;
+                count++;
+            }
+        }
+    }
+
+    return count;
+}
+
 int flb_ml_stream_destroy(struct flb_ml_stream *mst)
 {
     mk_list_del(&mst->_head);

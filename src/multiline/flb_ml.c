@@ -112,6 +112,15 @@ void flb_ml_flush_parser_instance(struct flb_ml *ml,
             continue;
         }
 
+        /*
+         * A flush of every stream (stream_id == 0, e.g. from the flush timer)
+         * skips streams whose owner asked to keep their pending data. Flushes
+         * of one specific stream are always honored.
+         */
+        if (stream_id == 0 && mst->flush_hold == FLB_TRUE) {
+            continue;
+        }
+
         /* Iterate stream groups */
         mk_list_foreach(head_group, &mst->groups) {
             group = mk_list_entry(head_group, struct flb_ml_stream_group, _head);

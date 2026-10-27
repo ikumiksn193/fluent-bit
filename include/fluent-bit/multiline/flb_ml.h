@@ -144,6 +144,7 @@ struct flb_ml_stream {
 
     /* runtime flags */
     int forced_flush;
+    int flush_hold;           /* skip this stream on timer flushes */
 
     /* parent context */
     struct flb_ml *ml;
@@ -357,6 +358,13 @@ int flb_ml_stream_create(struct flb_ml *ml,
 int flb_ml_stream_destroy(struct flb_ml_stream *mst);
 
 void flb_ml_stream_id_destroy_all(struct flb_ml *ml, uint64_t stream_id);
+
+int flb_ml_stream_id_has_pending(struct flb_ml *ml, uint64_t stream_id);
+int flb_ml_stream_id_move_pending(struct flb_ml *ml,
+                                  uint64_t src_stream_id,
+                                  uint64_t dst_stream_id);
+int flb_ml_stream_id_set_flush_hold(struct flb_ml *ml, uint64_t stream_id,
+                                    int hold);
 
 struct flb_ml_stream *flb_ml_stream_get(struct flb_ml_parser_ins *parser,
                                         uint64_t stream_id);
