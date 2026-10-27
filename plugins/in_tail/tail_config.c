@@ -199,6 +199,12 @@ struct flb_tail_config *flb_tail_config_create(struct flb_input_instance *ins,
         return NULL;
     }
 
+    if (ctx->rotate_handoff_wait_ms < 0) {
+        flb_plg_error(ctx->ins, "invalid 'rotate_handoff_wait_ms' config value");
+        flb_tail_config_destroy(ctx);
+        return NULL;
+    }
+
 #ifdef FLB_SYSTEM_WINDOWS
     tmp = flb_input_get_property("windows.path_encoding", ins);
     if (tmp) {

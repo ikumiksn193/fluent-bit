@@ -54,6 +54,16 @@ struct flb_tail_file {
     size_t name_len;
     size_t orig_name_len;
     time_t rotated;
+
+    /*
+     * Rotation handoff (rotate_handoff): 'rotate_prev' is the rotated file
+     * that this file replaced, 'rotate_next' is the file that replaced this
+     * one. While 'rotate_prev' is set this file is not read.
+     */
+    struct flb_tail_file *rotate_prev;
+    struct flb_tail_file *rotate_next;
+    uint64_t rotate_activity;   /* last read activity on a rotated file (ns) */
+    int rotate_replaced;        /* a replacement was already linked */
     int64_t pending_bytes;
     size_t stream_offset;       /* this represents the logical data offset
                                    which for compressed files could be higher

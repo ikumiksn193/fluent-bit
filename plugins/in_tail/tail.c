@@ -368,6 +368,37 @@ static int in_tail_watcher_callback(struct flb_input_instance *ins,
     return ret;
 }
 
+/*
+ * Rotation handoff timer: register the replacement of a rotated file as soon
+ * as it appears (the watcher does the same, but only every
+ * 'watcher_interval') and wake up the collectors so held files are
+ * re-evaluated. The timer pauses itself when there is nothing to do and is
+ * resumed when a file is rotated or put on hold.
+ */
+static int in_tail_rotate_handoff_callback(struct flb_input_instance *ins,
+                                           struct flb_config *config,
+                                           void *context)
+{
+    struct flb_tail_config *ctx = context;
+
+    (void) config;
+
+    if (flb_tail_file_rotate_handoff_idle(ctx) == FLB_TRUE) {
+        flb_plg_trace(ctx->ins, "rotation handoff timer paused");
+        flb_input_collector_pause(ctx->coll_fd_rotate_handoff, ins);
+        return 0;
+    }
+
+    flb_tail_file_discover_rotated_replacements(ctx);
+
+    if (ctx->rotate_handoff_count > 0) {
+        tail_signal_manager(ctx);
+        tail_signal_pending(ctx);
+    }
+
+    return 0;
+}
+
 int in_tail_collect_event(void *file, struct flb_config *config)
 {
     int ret;
@@ -474,6 +505,21 @@ static int in_tail_init(struct flb_input_instance *in,
     }
     ctx->coll_fd_rotated = ret;
 
+    /* Register callback to release files held by the rotation handoff */
+    ctx->coll_fd_rotate_handoff = -1;
+    if (ctx->rotate_handoff == FLB_TRUE) {
+        ret = flb_input_set_collector_time(in, in_tail_rotate_handoff_callback,
+                                           0,
+                                           FLB_TAIL_ROTATE_HANDOFF_CHECK_MS *
+                                           1000000,
+                                           config);
+        if (ret == -1) {
+            flb_tail_config_destroy(ctx);
+            return -1;
+        }
+        ctx->coll_fd_rotate_handoff = ret;
+    }
+
     /* Register callback to process pending bytes in promoted files */
     ret = flb_input_set_collector_event(in, in_tail_collect_pending,
                                         ctx->ch_pending[0], config);//1, 0, config);
@@ -536,6 +582,7 @@ static int in_tail_exit(void *data, struct flb_config *config)
     (void) *config;
     struct flb_tail_config *ctx = data;
 
+    ctx->coll_fd_rotate_handoff = -1;
     flb_tail_file_remove_all(ctx);
     flb_tail_fs_exit(ctx);
     flb_tail_config_destroy(ctx);
@@ -654,6 +701,24 @@ static struct flb_config_map config_map[] = {
      0, FLB_TRUE, offsetof(struct flb_tail_config, rotate_wait),
      "specify the number of extra time in seconds to monitor a file once is "
      "rotated in case some pending data is flushed."
+    },
+    {
+     FLB_CONFIG_MAP_BOOL, "rotate_handoff", "false",
+     0, FLB_TRUE, offsetof(struct flb_tail_config, rotate_handoff),
+     "if enabled, a file that replaces a rotated file is not read until the "
+     "rotated file has been read to its end and stopped growing. When "
+     "'multiline.parser' is set, a message left unfinished at the end of the "
+     "rotated file is continued with the first lines of the new file. This "
+     "joins CRI partial (P) and full (F) lines that a container runtime "
+     "splits across a log rotation."
+    },
+    {
+     FLB_CONFIG_MAP_INT, "rotate_handoff_wait_ms", FLB_TAIL_ROTATE_HANDOFF_WAIT_MS,
+     0, FLB_TRUE, offsetof(struct flb_tail_config, rotate_handoff_wait_ms),
+     "with 'rotate_handoff' enabled, time in milliseconds a rotated file must "
+     "stay without new data before the file that replaced it is read. The "
+     "wait ends earlier when the rotated file ends with an unfinished "
+     "multiline message, and never lasts longer than 'rotate_wait'."
     },
     {
      FLB_CONFIG_MAP_BOOL, "docker_mode", "false",

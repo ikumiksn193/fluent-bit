@@ -1397,6 +1397,223 @@ static int ml_flush_callback(struct flb_ml_parser *parser,
     return 0;
 }
 
+/*
+ * Rotation handoff
+ * ================
+ *
+ * When a file is rotated by rename and a new file is created in its place,
+ * the writer may still append a few bytes to the rotated file after the new
+ * file already received data. A container runtime that rotates in the middle
+ * of a log line writes a CRI partial line ('P') at the end of the rotated
+ * file and the rest of the line ('F') at the start of the new one.
+ *
+ * Without coordination both files are read concurrently and each one has its
+ * own multiline stream, so the two halves are never joined. With
+ * 'rotate_handoff' enabled the new file is linked to the rotated file it
+ * replaces and is not read until the rotated file is drained. On release,
+ * any multiline message left unfinished in the rotated file is moved to the
+ * stream of the new file, so it is continued by the next lines.
+ *
+ * The rotated file is considered drained when every byte has been read and
+ * either:
+ *
+ *   - its multiline stream holds an unfinished message: the writer has
+ *     already moved on and the message continues in the new file, or
+ *   - no new data was read from it for 'rotate_handoff_wait_ms'.
+ *
+ * The hold never lasts longer than 'rotate_wait': once the rotated file is
+ * purged, the new file is released.
+ */
+/*
+ * The handoff timer only needs to run while there are rotated files (to
+ * find their replacements quickly) or files on hold (to re-evaluate them).
+ * It pauses itself when idle, this resumes it.
+ */
+static void rotate_handoff_timer_resume(struct flb_tail_config *ctx)
+{
+    if (ctx->coll_fd_rotate_handoff < 0) {
+        return;
+    }
+
+    if (flb_input_collector_running(ctx->coll_fd_rotate_handoff,
+                                    ctx->ins) == FLB_TRUE) {
+        return;
+    }
+
+    flb_plg_trace(ctx->ins, "rotation handoff timer resumed");
+    flb_input_collector_resume(ctx->coll_fd_rotate_handoff, ctx->ins);
+}
+
+int flb_tail_file_rotate_handoff_idle(struct flb_tail_config *ctx)
+{
+    if (ctx->rotate_handoff_count > 0) {
+        return FLB_FALSE;
+    }
+
+    if (mk_list_size(&ctx->files_rotated) > 0) {
+        return FLB_FALSE;
+    }
+
+    return FLB_TRUE;
+}
+
+static void rotate_handoff_unlink(struct flb_tail_file *prev,
+                                  struct flb_tail_file *next)
+{
+    struct flb_tail_config *ctx = next->config;
+
+    prev->rotate_next = NULL;
+    next->rotate_prev = NULL;
+
+    if (ctx->rotate_handoff_count > 0) {
+        ctx->rotate_handoff_count--;
+    }
+}
+
+/* Release 'file' and move pending multiline state from its rotated file */
+static void rotate_handoff_release(struct flb_tail_file *file)
+{
+    int ret;
+    struct flb_tail_file *prev = file->rotate_prev;
+    struct flb_tail_config *ctx = file->config;
+
+    if (!prev) {
+        return;
+    }
+
+    if (ctx->ml_ctx && prev->ml_stream_id > 0 && file->ml_stream_id > 0 &&
+        flb_ml_stream_id_has_pending(ctx->ml_ctx,
+                                     prev->ml_stream_id) == FLB_TRUE) {
+        ret = flb_ml_stream_id_move_pending(ctx->ml_ctx,
+                                            prev->ml_stream_id,
+                                            file->ml_stream_id);
+        if (ret == 0) {
+            flb_plg_debug(ctx->ins, "inode=%"PRIu64" continues the multiline "
+                          "message left in rotated inode=%"PRIu64" %s",
+                          file->inode, prev->inode, prev->name);
+        }
+    }
+
+    if (ctx->ml_ctx && prev->ml_stream_id > 0) {
+        flb_ml_stream_id_set_flush_hold(ctx->ml_ctx, prev->ml_stream_id,
+                                        FLB_FALSE);
+    }
+
+    flb_plg_debug(ctx->ins, "inode=%"PRIu64" rotation handoff released "
+                  "(rotated inode=%"PRIu64")", file->inode, prev->inode);
+
+    /*
+     * If this file was rotated while on hold, give it the full 'rotate_wait'
+     * from now on: it has not been read at all so far.
+     */
+    if (file->rotated > 0) {
+        file->rotated = time(NULL);
+    }
+
+    rotate_handoff_unlink(prev, file);
+}
+
+/* Returns FLB_TRUE when the rotated file that 'file' replaced is drained */
+static int rotate_handoff_ready(struct flb_tail_file *file)
+{
+    int ret;
+    uint64_t now;
+    uint64_t wait_ns;
+    struct stat st;
+    struct flb_tail_file *prev = file->rotate_prev;
+    struct flb_tail_config *ctx = file->config;
+
+    ret = fstat(prev->fd, &st);
+    if (ret == -1) {
+        return FLB_TRUE;
+    }
+
+    /* unread data in the rotated file */
+    if (st.st_size > prev->offset) {
+        return FLB_FALSE;
+    }
+
+    if (prev->decompression_context != NULL &&
+        prev->decompression_context->input_buffer_length > 0) {
+        return FLB_FALSE;
+    }
+
+    /* the rotated file ends with an unfinished multiline message */
+    if (ctx->ml_ctx && prev->ml_stream_id > 0 &&
+        flb_ml_stream_id_has_pending(ctx->ml_ctx,
+                                     prev->ml_stream_id) == FLB_TRUE) {
+        return FLB_TRUE;
+    }
+
+    /* the rotated file stopped growing */
+    now = cfl_time_now();
+    wait_ns = (uint64_t) ctx->rotate_handoff_wait_ms * 1000000ULL;
+    if (now >= prev->rotate_activity + wait_ns) {
+        return FLB_TRUE;
+    }
+
+    return FLB_FALSE;
+}
+
+/*
+ * Link a newly registered file to the rotated file whose original name it
+ * takes over. If several rotated files used that name, the most recently
+ * rotated one that has not been replaced yet is used.
+ */
+static void rotate_handoff_link(struct flb_tail_file *file)
+{
+    struct mk_list *head;
+    struct flb_tail_file *f;
+    struct flb_tail_file *prev = NULL;
+    struct flb_tail_config *ctx = file->config;
+
+    mk_list_foreach(head, &ctx->files_rotated) {
+        f = mk_list_entry(head, struct flb_tail_file, _rotate_head);
+        if (f == file || f->rotate_replaced == FLB_TRUE) {
+            continue;
+        }
+
+        if (strcmp(f->orig_name, file->name) != 0) {
+            continue;
+        }
+
+        if (prev == NULL || f->rotated >= prev->rotated) {
+            prev = f;
+        }
+    }
+
+    if (!prev) {
+        return;
+    }
+
+    prev->rotate_next = file;
+    prev->rotate_replaced = FLB_TRUE;
+    prev->rotate_activity = cfl_time_now();
+    file->rotate_prev = prev;
+    ctx->rotate_handoff_count++;
+    rotate_handoff_timer_resume(ctx);
+
+    flb_plg_debug(ctx->ins, "inode=%"PRIu64" %s on hold until rotated "
+                  "inode=%"PRIu64" %s is drained",
+                  file->inode, file->name, prev->inode, prev->name);
+}
+
+/*
+ * Wake up the collector of the file that replaced 'file' so the handoff is
+ * re-evaluated right away instead of on the next timer tick.
+ */
+static void rotate_handoff_notify(struct flb_tail_file *file)
+{
+    struct flb_tail_file *next = file->rotate_next;
+
+    if (next->tail_mode == FLB_TAIL_STATIC) {
+        tail_signal_manager(file->config);
+    }
+    else {
+        tail_signal_pending(file->config);
+    }
+}
+
 int flb_tail_file_append(char *path, struct stat *st, int mode,
                          ssize_t offset,
                          struct flb_tail_config *ctx)
@@ -1708,6 +1925,10 @@ int flb_tail_file_append(char *path, struct stat *st, int mode,
                   "inode=%"PRIu64" with offset=%"PRId64" appended as %s",
                   file->inode, file->offset, path);
 
+    if (ctx->rotate_handoff == FLB_TRUE) {
+        rotate_handoff_link(file);
+    }
+
 #ifdef FLB_HAVE_METRICS
     name = (char *) flb_input_name(ctx->ins);
     ts = cfl_time_now();
@@ -1790,6 +2011,18 @@ void flb_tail_file_remove(struct flb_tail_file *file)
 
     flb_plg_debug(ctx->ins, "inode=%"PRIu64" removing file name %s",
                   file->inode, file->name);
+
+    /*
+     * Rotation handoff: a rotated file that goes away releases the file that
+     * replaced it (and hands over its pending multiline state); a held file
+     * that goes away just detaches from its rotated file.
+     */
+    if (file->rotate_next) {
+        rotate_handoff_release(file->rotate_next);
+    }
+    if (file->rotate_prev) {
+        rotate_handoff_unlink(file->rotate_prev, file);
+    }
 
     if (file->read_retry_pending) {
         mk_list_del(&file->_retry_head);
@@ -1939,6 +2172,7 @@ int flb_tail_file_chunk(struct flb_tail_file *file)
     char                   *tmp;
     int                     ret;
     int                     lines;
+    struct stat             st;
     struct flb_tail_config *ctx;
 
     /* Check if we the engine issued a pause */
@@ -1950,6 +2184,24 @@ int flb_tail_file_chunk(struct flb_tail_file *file)
 
     if (file->read_retry_pending) {
         return FLB_TAIL_RETRY;
+    }
+
+    /* Rotation handoff: do not read until the rotated file is drained */
+    if (file->rotate_prev) {
+        if (rotate_handoff_ready(file) == FLB_FALSE) {
+            /*
+             * A held file is not watched yet, so check here whether it was
+             * rotated too. Otherwise the file that replaces it could be
+             * rotated away before it is ever registered.
+             */
+            if (file->rotated == 0 &&
+                fstat(file->fd, &st) == 0 && st.st_nlink > 0 &&
+                flb_tail_file_is_rotated(ctx, file) == FLB_TRUE) {
+                flb_tail_file_rotated(file);
+            }
+            return FLB_TAIL_RETRY;
+        }
+        rotate_handoff_release(file);
     }
 
     file_buffer_capacity = (file->buf_size - file->buf_len) - 1;
@@ -2140,6 +2392,11 @@ int flb_tail_file_chunk(struct flb_tail_file *file)
         file->buf_len += stream_data_length;
         file->buf_data[file->buf_len] = '\0';
 
+        /* the rotated file is still being written: keep its replacement held */
+        if (file->rotate_next && raw_data_length > 0) {
+            file->rotate_activity = cfl_time_now();
+        }
+
         /* Now that we have some data in the buffer, call the data processor
          * which aims to cut lines and register the entries into the engine.
          *
@@ -2173,6 +2430,15 @@ int flb_tail_file_chunk(struct flb_tail_file *file)
         /* We reached the end of file, let's wait for some incoming data */
         ret = adjust_counters(ctx, file);
         if (ret == FLB_TAIL_OK) {
+            /*
+             * A rotated file that ends with an unfinished multiline message
+             * can release the file that replaced it now.
+             */
+            if (file->rotate_next && ctx->ml_ctx && file->ml_stream_id > 0 &&
+                flb_ml_stream_id_has_pending(ctx->ml_ctx,
+                                             file->ml_stream_id) == FLB_TRUE) {
+                rotate_handoff_notify(file);
+            }
             return FLB_TAIL_WAIT;
         }
         else {
@@ -2506,6 +2772,19 @@ int flb_tail_file_rotated(struct flb_tail_file *file)
         file->rotated = time(NULL);
         mk_list_add(&file->_rotate_head, &file->config->files_rotated);
 
+        if (ctx->rotate_handoff == FLB_TRUE) {
+            /*
+             * An unfinished multiline message at the end of this file may
+             * continue in the file that replaces it: keep it out of the
+             * timer flushes until the handoff is done or the file is purged.
+             */
+            if (ctx->ml_ctx && file->ml_stream_id > 0) {
+                flb_ml_stream_id_set_flush_hold(ctx->ml_ctx,
+                                                file->ml_stream_id, FLB_TRUE);
+            }
+            rotate_handoff_timer_resume(ctx);
+        }
+
     /* Rotate the file in the database */
 #ifdef FLB_HAVE_SQLDB
         if (file->config->db) {
@@ -2570,6 +2849,11 @@ int flb_tail_file_discover_rotated_replacements(struct flb_tail_config *ctx)
 
     mk_list_foreach(head, &ctx->files_rotated) {
         file = mk_list_entry(head, struct flb_tail_file, _rotate_head);
+
+        /* The replacement of this file is already registered and linked */
+        if (file->rotate_replaced == FLB_TRUE) {
+            continue;
+        }
 
         /* Check if a new file has been created with the original name */
         ret = tail_file_stat(ctx, file->orig_name, &st);
@@ -2665,6 +2949,12 @@ int flb_tail_file_purge(struct flb_input_instance *ins,
     now = time(NULL);
     mk_list_foreach_safe(head, tmp, &ctx->files_rotated) {
         file = mk_list_entry(head, struct flb_tail_file, _rotate_head);
+
+        /* a file on rotation handoff hold has not been read yet */
+        if (file->rotate_prev != NULL) {
+            continue;
+        }
+
         if ((file->rotated + ctx->rotate_wait) <= now) {
             ret = fstat(file->fd, &st);
             if (ret == 0) {
@@ -2697,10 +2987,17 @@ int flb_tail_file_purge(struct flb_input_instance *ins,
      */
     mk_list_foreach_safe(head, tmp, &ctx->files_static) {
         file = mk_list_entry(head, struct flb_tail_file, _head);
+        /* keep held files (rotation handoff) until they have been read */
+        if (file->rotate_prev != NULL) {
+            continue;
+        }
         check_purge_deleted_file(ctx, file, now);
     }
     mk_list_foreach_safe(head, tmp, &ctx->files_event) {
         file = mk_list_entry(head, struct flb_tail_file, _head);
+        if (file->rotate_prev != NULL) {
+            continue;
+        }
         check_purge_deleted_file(ctx, file, now);
     }
 

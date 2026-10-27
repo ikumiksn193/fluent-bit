@@ -38,6 +38,8 @@
 #define FLB_TAIL_CHUNK              "32768"   /* buffer chunk = 32KB      */
 #define FLB_TAIL_REFRESH                 60   /* refresh every 60 seconds */
 #define FLB_TAIL_ROTATE_WAIT             "5"  /* time to monitor after rotation */
+#define FLB_TAIL_ROTATE_HANDOFF_WAIT_MS "250" /* rotated file idle time */
+#define FLB_TAIL_ROTATE_HANDOFF_CHECK_MS  50  /* handoff check interval */
 #define FLB_TAIL_STATIC_BATCH_SIZE      "50M" /* static batch size */
 #define FLB_TAIL_EVENT_BATCH_SIZE       "50M" /* event batch size */
 

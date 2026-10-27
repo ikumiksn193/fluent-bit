@@ -74,6 +74,7 @@ struct flb_tail_config {
     int coll_fd_scan;
     int coll_fd_watcher;
     int coll_fd_rotated;
+    int coll_fd_rotate_handoff; /* rotation handoff check timer */
     int coll_fd_pending;
     int coll_fd_inactive;
     int coll_fd_dmode_flush;
@@ -94,6 +95,9 @@ struct flb_tail_config {
     int read_newly_discovered_files_from_head; /* read new files from head after startup */
     int read_from_head;        /* read new files from head     */
     int rotate_wait;           /* sec to wait on rotated files */
+    int rotate_handoff;        /* read rotated file before its replacement */
+    int rotate_handoff_wait_ms; /* idle time before releasing replacement */
+    int rotate_handoff_count;  /* replacement files currently on hold */
     int watcher_interval;      /* watcher interval             */
     int ignore_older;          /* ignore fields older than X seconds */
     int ignore_active_older_files; /* ignore files that exceed the ignore
