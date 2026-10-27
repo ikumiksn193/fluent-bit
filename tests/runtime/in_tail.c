@@ -3268,6 +3268,251 @@ void flb_test_rotated_replacement_discovery()
 }
 #endif /* !FLB_SYSTEM_WINDOWS */
 
+#ifndef FLB_SYSTEM_WINDOWS
+/*
+ * Rotation handoff tests
+ *
+ * A container runtime that rotates in the middle of a log line writes a CRI
+ * partial line ('P') at the end of the rotated file and the rest of the line
+ * ('F') at the start of the new file. These tests rotate by rename + create
+ * and check that 'rotate_handoff' joins both halves and keeps the order of
+ * the rotated file before the new one.
+ */
+static pthread_mutex_t handoff_mutex = PTHREAD_MUTEX_INITIALIZER;
+static flb_sds_t handoff_output = NULL;
+
+static int cb_handoff_collect(void *record, size_t size, void *data)
+{
+    (void) data;
+
+    pthread_mutex_lock(&handoff_mutex);
+    if (handoff_output == NULL) {
+        handoff_output = flb_sds_create_size(1024);
+    }
+    if (handoff_output != NULL) {
+        flb_sds_cat_safe(&handoff_output, (char *) record, size);
+    }
+    pthread_mutex_unlock(&handoff_mutex);
+
+    flb_free(record);
+    return 0;
+}
+
+/* Returns the offset of 'needle' in the collected output or -1 */
+static int handoff_output_find(const char *needle)
+{
+    char *p;
+    int ret = -1;
+
+    pthread_mutex_lock(&handoff_mutex);
+    if (handoff_output != NULL) {
+        p = strstr(handoff_output, needle);
+        if (p != NULL) {
+            ret = p - handoff_output;
+        }
+    }
+    pthread_mutex_unlock(&handoff_mutex);
+
+    return ret;
+}
+
+static void handoff_output_reset()
+{
+    pthread_mutex_lock(&handoff_mutex);
+    if (handoff_output != NULL) {
+        flb_sds_destroy(handoff_output);
+        handoff_output = NULL;
+    }
+    pthread_mutex_unlock(&handoff_mutex);
+}
+
+static void handoff_write(int fd, const char *line)
+{
+    ssize_t ret;
+
+    ret = write(fd, line, strlen(line));
+    TEST_CHECK(ret == (ssize_t) strlen(line));
+    fsync(fd);
+}
+
+/*
+ * 'late_partial': write the F line to the new file before the P line is
+ * written to the rotated file, like a container runtime whose old log writer
+ * is closed after the new one started.
+ */
+static void rotate_handoff_cri_run(int handoff, int late_partial)
+{
+    int ret;
+    int fd_new;
+    struct flb_lib_out_cb cb_data;
+    struct test_tail_ctx *ctx;
+    char *file[] = {"rotate_handoff_cri.log"};
+    char *rotated = "rotate_handoff_cri.log.1";
+    char *line_p = "2026-10-27T10:52:00.000000001Z stdout P FIRST_\n";
+    char *line_f = "2026-10-27T10:52:00.000000002Z stdout F SECOND\n";
+
+    handoff_output_reset();
+    unlink(rotated);
+
+    cb_data.cb = cb_handoff_collect;
+    cb_data.data = NULL;
+
+    ctx = test_tail_ctx_create(&cb_data, &file[0], 1, FLB_TRUE);
+    if (!TEST_CHECK(ctx != NULL)) {
+        TEST_MSG("test_ctx_create failed");
+        exit(EXIT_FAILURE);
+    }
+
+    ret = flb_input_set(ctx->flb, ctx->i_ffd,
+                        "path", file[0],
+                        "read_from_head", "true",
+                        "refresh_interval", "1",
+                        "multiline.parser", "cri",
+                        "rotate_handoff", handoff ? "true" : "false",
+                        NULL);
+    TEST_CHECK(ret == 0);
+
+    ret = flb_output_set(ctx->flb, ctx->o_ffd,
+                         "format", "json",
+                         NULL);
+    TEST_CHECK(ret == 0);
+
+    ret = flb_start(ctx->flb);
+    TEST_CHECK(ret == 0);
+    flb_time_msleep(1000);
+
+    if (!late_partial) {
+        handoff_write(ctx->fds[0], line_p);
+        flb_time_msleep(200);
+    }
+
+    /* rotate: rename, then create the new file */
+    ret = rename(file[0], rotated);
+    TEST_CHECK(ret == 0);
+    fd_new = open(file[0], O_RDWR | O_CREAT | O_APPEND,
+                  S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
+    TEST_CHECK(fd_new >= 0);
+    handoff_write(fd_new, line_f);
+
+    if (late_partial) {
+        flb_time_msleep(50);
+        handoff_write(ctx->fds[0], line_p);
+    }
+
+    /* longer than the 4 seconds flush timeout of the cri parser */
+    flb_time_msleep(6000);
+
+    if (handoff) {
+        ret = handoff_output_find("\"log\":\"FIRST_SECOND\"");
+        if (!TEST_CHECK(ret >= 0)) {
+            TEST_MSG("joined record not found");
+        }
+        TEST_CHECK(handoff_output_find("\"log\":\"FIRST_\"") == -1);
+        TEST_CHECK(handoff_output_find("\"log\":\"SECOND\"") == -1);
+    }
+    else {
+        /*
+         * Without handoff the second half is emitted on its own. The first
+         * half stays in the stream of the rotated file until it is purged.
+         */
+        TEST_CHECK(handoff_output_find("\"log\":\"SECOND\"") >= 0);
+        TEST_CHECK(handoff_output_find("\"log\":\"FIRST_SECOND\"") == -1);
+    }
+
+    close(fd_new);
+    unlink(rotated);
+    test_tail_ctx_destroy(ctx);
+    handoff_output_reset();
+}
+
+void flb_test_rotate_handoff_cri_partial()
+{
+    rotate_handoff_cri_run(FLB_TRUE, FLB_FALSE);
+}
+
+void flb_test_rotate_handoff_cri_late_partial()
+{
+    rotate_handoff_cri_run(FLB_TRUE, FLB_TRUE);
+}
+
+void flb_test_rotate_handoff_disabled()
+{
+    rotate_handoff_cri_run(FLB_FALSE, FLB_FALSE);
+}
+
+/* Without multiline: lines of the rotated file come before the new file */
+void flb_test_rotate_handoff_order()
+{
+    int ret;
+    int fd_new;
+    int pos_old;
+    int pos_new;
+    struct flb_lib_out_cb cb_data;
+    struct test_tail_ctx *ctx;
+    char *file[] = {"rotate_handoff_order.log"};
+    char *rotated = "rotate_handoff_order.log.1";
+
+    handoff_output_reset();
+    unlink(rotated);
+
+    cb_data.cb = cb_handoff_collect;
+    cb_data.data = NULL;
+
+    ctx = test_tail_ctx_create(&cb_data, &file[0], 1, FLB_TRUE);
+    if (!TEST_CHECK(ctx != NULL)) {
+        TEST_MSG("test_ctx_create failed");
+        exit(EXIT_FAILURE);
+    }
+
+    ret = flb_input_set(ctx->flb, ctx->i_ffd,
+                        "path", file[0],
+                        "read_from_head", "true",
+                        "refresh_interval", "1",
+                        "rotate_handoff", "true",
+                        NULL);
+    TEST_CHECK(ret == 0);
+
+    ret = flb_output_set(ctx->flb, ctx->o_ffd,
+                         "format", "json",
+                         NULL);
+    TEST_CHECK(ret == 0);
+
+    ret = flb_start(ctx->flb);
+    TEST_CHECK(ret == 0);
+    flb_time_msleep(1000);
+
+    handoff_write(ctx->fds[0], "OLD_FIRST\n");
+    flb_time_msleep(200);
+
+    ret = rename(file[0], rotated);
+    TEST_CHECK(ret == 0);
+    fd_new = open(file[0], O_RDWR | O_CREAT | O_APPEND,
+                  S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
+    TEST_CHECK(fd_new >= 0);
+    handoff_write(fd_new, "NEW_FIRST\n");
+
+    /* the old writer is still flushing its last line */
+    flb_time_msleep(50);
+    handoff_write(ctx->fds[0], "OLD_LATE\n");
+
+    flb_time_msleep(3000);
+
+    pos_old = handoff_output_find("\"log\":\"OLD_LATE\"");
+    pos_new = handoff_output_find("\"log\":\"NEW_FIRST\"");
+    TEST_CHECK(handoff_output_find("\"log\":\"OLD_FIRST\"") >= 0);
+    TEST_CHECK(pos_old >= 0);
+    TEST_CHECK(pos_new >= 0);
+    if (!TEST_CHECK(pos_old < pos_new)) {
+        TEST_MSG("rotated file line emitted after the new file line");
+    }
+
+    close(fd_new);
+    unlink(rotated);
+    test_tail_ctx_destroy(ctx);
+    handoff_output_reset();
+}
+#endif /* !FLB_SYSTEM_WINDOWS */
+
 TEST_LIST = {
     {"issue_3943", flb_test_in_tail_issue_3943},
     /* Properties */
@@ -3292,6 +3537,10 @@ TEST_LIST = {
     {"ignore_active_older_files_reread_on_update_default_read_from_head", flb_test_in_tail_ignore_active_older_files_reread_on_update_default_read_from_head},
 #ifndef FLB_SYSTEM_WINDOWS
     {"rotated_replacement_discovery", flb_test_rotated_replacement_discovery},
+    {"rotate_handoff_cri_partial", flb_test_rotate_handoff_cri_partial},
+    {"rotate_handoff_cri_late_partial", flb_test_rotate_handoff_cri_late_partial},
+    {"rotate_handoff_disabled", flb_test_rotate_handoff_disabled},
+    {"rotate_handoff_order", flb_test_rotate_handoff_order},
 #endif
 #ifdef FLB_HAVE_INOTIFY
     {"inotify_watcher_false", flb_test_inotify_watcher_false},
