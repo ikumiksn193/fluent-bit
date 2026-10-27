@@ -585,6 +585,174 @@ static void test_parser_docker()
     flb_config_exit(config);
 }
 
+/*
+ * Rotation handoff: the first part of a CRI message lands in one stream
+ * (rotated file) and the rest in another one (new file). Moving the pending
+ * state must make the destination stream emit the joined message, and the
+ * source stream must not emit anything.
+ */
+struct record_check stream_move_src_input[] = {
+  {"2019-05-07T18:57:50.904275087+00:00 stdout P 1a. some "},
+  {"2019-05-07T18:57:50.904275087+00:00 stderr P 1b. some "},
+  {"2019-05-07T18:57:51.904275088+00:00 stdout P multiline "},
+};
+
+struct record_check stream_move_dst_input[] = {
+  {"2019-05-07T18:57:52.904275089+00:00 stdout F log"},
+  {"2019-05-07T18:57:52.904275089+00:00 stderr P multiline "},
+  {"2019-05-07T18:57:52.904275089+00:00 stderr F log"},
+  {"2019-05-07T18:57:53.904275090+00:00 stdout F 2a. single line"},
+};
+
+struct record_check stream_move_dst_output[] = {
+  {"1a. some multiline log"},
+  {"1b. some multiline log"},
+  {"2a. single line"},
+};
+
+static void stream_move_append(struct flb_ml *ml, uint64_t stream_id,
+                               struct record_check *records, int entries)
+{
+    int i;
+    struct flb_time tm;
+
+    for (i = 0; i < entries; i++) {
+        flb_time_get(&tm);
+        flb_ml_append_text(ml, stream_id, &tm, records[i].buf,
+                           strlen(records[i].buf));
+    }
+}
+
+static void test_stream_move_pending()
+{
+    int ret;
+    uint64_t src_id;
+    uint64_t dst_id;
+    struct flb_config *config;
+    struct flb_ml *ml;
+    struct flb_ml_parser_ins *mlp_i;
+    struct expected_result res_src = {0};
+    struct expected_result res_dst = {0};
+
+    res_src.key = "log";
+    res_src.out_records = stream_move_dst_output;
+    res_dst.key = "log";
+    res_dst.out_records = stream_move_dst_output;
+
+    config = flb_config_init();
+
+    ml = flb_ml_create(config, "stream-move-test");
+    TEST_CHECK(ml != NULL);
+
+    /* same parsers as in_tail with 'multiline.parser docker, cri' */
+    mlp_i = flb_ml_parser_instance_create(ml, "docker");
+    TEST_CHECK(mlp_i != NULL);
+    mlp_i = flb_ml_parser_instance_create(ml, "cri");
+    TEST_CHECK(mlp_i != NULL);
+
+    ret = flb_ml_stream_create(ml, "src", -1, flush_callback, (void *) &res_src,
+                               &src_id);
+    TEST_CHECK(ret == 0);
+    ret = flb_ml_stream_create(ml, "dst", -1, flush_callback, (void *) &res_dst,
+                               &dst_id);
+    TEST_CHECK(ret == 0);
+
+    TEST_CHECK(flb_ml_stream_id_has_pending(ml, src_id) == FLB_FALSE);
+
+    stream_move_append(ml, src_id, stream_move_src_input,
+                       sizeof(stream_move_src_input) / sizeof(struct record_check));
+    TEST_CHECK(flb_ml_stream_id_has_pending(ml, src_id) == FLB_TRUE);
+    TEST_CHECK(flb_ml_stream_id_has_pending(ml, dst_id) == FLB_FALSE);
+
+    /* moving to the same stream or into a stream with pending data fails */
+    TEST_CHECK(flb_ml_stream_id_move_pending(ml, src_id, src_id) == -1);
+    TEST_CHECK(flb_ml_stream_id_move_pending(ml, dst_id, src_id) == -1);
+
+    ret = flb_ml_stream_id_move_pending(ml, src_id, dst_id);
+    TEST_CHECK(ret == 0);
+    TEST_CHECK(flb_ml_stream_id_has_pending(ml, src_id) == FLB_FALSE);
+    TEST_CHECK(flb_ml_stream_id_has_pending(ml, dst_id) == FLB_TRUE);
+
+    stream_move_append(ml, dst_id, stream_move_dst_input,
+                       sizeof(stream_move_dst_input) / sizeof(struct record_check));
+
+    /* destroying the source must not flush anything */
+    flb_ml_stream_id_destroy_all(ml, src_id);
+    TEST_CHECK(res_src.current_record == 0);
+
+    TEST_CHECK(res_dst.current_record ==
+               sizeof(stream_move_dst_output) / sizeof(struct record_check));
+    TEST_MSG("dst records: %i", res_dst.current_record);
+
+    flb_ml_destroy(ml);
+    flb_config_exit(config);
+}
+
+/*
+ * A stream with flush hold keeps its pending data on a timer flush
+ * (flb_ml_flush_pending_now) and still flushes it when the hold is lifted
+ * or when the stream is destroyed.
+ */
+static void test_stream_flush_hold()
+{
+    int ret;
+    uint64_t held_id;
+    uint64_t other_id;
+    struct flb_config *config;
+    struct flb_ml *ml;
+    struct flb_ml_parser_ins *mlp_i;
+    struct expected_result res_held = {0};
+    struct expected_result res_other = {0};
+    struct record_check held_output[] = {{"1a. some "}, {"1a. some "}};
+    struct record_check other_output[] = {{"1b. some "}};
+
+    res_held.key = "log";
+    res_held.out_records = held_output;
+    res_other.key = "log";
+    res_other.out_records = other_output;
+
+    config = flb_config_init();
+
+    ml = flb_ml_create(config, "flush-hold-test");
+    TEST_CHECK(ml != NULL);
+
+    mlp_i = flb_ml_parser_instance_create(ml, "cri");
+    TEST_CHECK(mlp_i != NULL);
+
+    ret = flb_ml_stream_create(ml, "held", -1, flush_callback, (void *) &res_held,
+                               &held_id);
+    TEST_CHECK(ret == 0);
+    ret = flb_ml_stream_create(ml, "other", -1, flush_callback,
+                               (void *) &res_other, &other_id);
+    TEST_CHECK(ret == 0);
+
+    stream_move_append(ml, held_id, &stream_move_src_input[0], 1);
+    stream_move_append(ml, other_id, &stream_move_src_input[1], 1);
+
+    ret = flb_ml_stream_id_set_flush_hold(ml, held_id, FLB_TRUE);
+    TEST_CHECK(ret == 1);
+
+    /* timer flush: only the stream without hold is flushed */
+    flb_ml_flush_pending_now(ml);
+    TEST_CHECK(res_held.current_record == 0);
+    TEST_CHECK(res_other.current_record == 1);
+    TEST_CHECK(flb_ml_stream_id_has_pending(ml, held_id) == FLB_TRUE);
+
+    /* lifting the hold makes the next timer flush emit it */
+    flb_ml_stream_id_set_flush_hold(ml, held_id, FLB_FALSE);
+    flb_ml_flush_pending_now(ml);
+    TEST_CHECK(res_held.current_record == 1);
+
+    /* destroying a held stream still flushes it */
+    stream_move_append(ml, held_id, &stream_move_src_input[0], 1);
+    flb_ml_stream_id_set_flush_hold(ml, held_id, FLB_TRUE);
+    flb_ml_stream_id_destroy_all(ml, held_id);
+    TEST_CHECK(res_held.current_record == 2);
+
+    flb_ml_destroy(ml);
+    flb_config_exit(config);
+}
+
 static void test_parser_cri()
 {
     int i;
@@ -2481,6 +2649,8 @@ TEST_LIST = {
     /* Normal features tests */
     { "parser_docker",  test_parser_docker},
     { "parser_cri",     test_parser_cri},
+    { "stream_move_pending", test_stream_move_pending},
+    { "stream_flush_hold",   test_stream_flush_hold},
     { "parser_docker_cri_chain", test_parser_docker_cri_chain},
     { "parser_java",    test_parser_java},
     { "parser_python",  test_parser_python},
