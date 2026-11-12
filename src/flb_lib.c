@@ -208,10 +208,10 @@ flb_ctx_t *flb_create()
 
     MK_EVENT_ZERO(ctx->event_channel);
 
-    ret = mk_event_channel_create(config->ch_evl,
-                                  &config->ch_notif[0],
-                                  &config->ch_notif[1],
-                                  ctx->event_channel);
+    ret = flb_pipe_event_channel_create(config->ch_evl,
+                                        &config->ch_notif[0],
+                                        &config->ch_notif[1],
+                                        ctx->event_channel);
     if (ret != 0) {
         flb_error("[lib] could not create notification channels");
         flb_stop(ctx);
@@ -710,27 +710,12 @@ int flb_lib_config_file(struct flb_lib_ctx *ctx, const char *path)
     char *cfg = NULL;
     char *end;
     char *real_path;
-    struct stat st;
 
-    /* Check if file exists and resolve path */
-    ret = stat(path, &st);
-    if (ret == -1 && errno == ENOENT) {
-        /* Try to resolve the real path (if exists) */
-        if (path[0] == '/') {
-            fprintf(stderr, "Error: configuration file not found: %s\n", path);
-            return -1;
-        }
-
-        if (ctx->config->conf_path) {
-            snprintf(tmp, PATH_MAX, "%s%s", ctx->config->conf_path, path);
-            cfg = tmp;
-        }
-        else {
-            cfg = (char *) path;
-        }
-    }
-    else {
-        cfg = (char *) path;
+    cfg = (char *) flb_utils_resolve_config_path(path, ctx->config->conf_path,
+                                                 tmp, sizeof(tmp));
+    if (!cfg) {
+        fprintf(stderr, "Error: configuration file path is too long: %s\n", path);
+        return -1;
     }
 
     if (access(cfg, R_OK) != 0) {
@@ -995,9 +980,6 @@ int static do_start(flb_ctx_t *ctx)
         }
         else if (val == FLB_ENGINE_FAILED) {
             flb_debug("[lib] backend failed");
-#if defined(FLB_SYSTEM_MACOS)
-            pthread_cancel(tid);
-#endif
             pthread_join(tid, NULL);
             ctx->status = FLB_LIB_ERROR;
             return -1;

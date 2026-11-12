@@ -43,14 +43,15 @@ def click_test(page, name, expected="passed"):
     return output
 
 
-def demo_records(output):
+def demo_records(output, require_message=True):
+    """Read emitted JSON objects, optionally restricting them to demo messages."""
     records = []
     for line in output.splitlines():
         try:
             value = json.loads(line)
         except ValueError:
             continue
-        if isinstance(value, dict) and "message" in value:
+        if isinstance(value, dict) and (not require_message or "message" in value):
             records.append(value)
     return records
 
@@ -179,6 +180,7 @@ def check_demo(page):
 
 
 def check_lua(page):
+    """Verify browser Lua callbacks, record drops, protected errors and recovery."""
     page.wait_for_function("!document.getElementById('load-lua-demo').disabled")
     page.locator('#load-lua-demo').click()
     example = page.locator('#demo-config').input_value()
@@ -206,10 +208,27 @@ def check_lua(page):
     assert demo_records(click_test(page, '#start-demo'))
     page.locator('#demo-config').fill(example.replace('return 2, timestamp, record', 'return -1, timestamp, record'))
     assert not demo_records(click_test(page, '#start-demo'))
-    # Protected Lua errors must not terminate the engine or corrupt the input.
+    # Protected Lua errors drop the failing records and keep the engine running.
     page.locator('#demo-config').fill(example.replace('record.total = 0', 'error("lua-protected-test")'))
     output = click_test(page, '#start-demo')
-    assert 'lua-protected-test' in output and demo_records(output), output
+    assert 'lua-protected-test' in output and 'dropping record' in output, output
+    assert not demo_records(output, require_message=False), output
+    # Preserve explicit drops and transformations across an error in the same batch.
+    for base in (example, extended, ordinary):
+        mixed = base.replace('name: dummy', 'name: dummy\n      samples: 1\n      copies: 4')
+        mixed = mixed.replace('function enrich(', 'local index = 0; function enrich(')
+        drop = 'return -1, timestamp, metadata, record' if base == extended else 'return -1, timestamp, record'
+        mixed = mixed.replace('record.total = 0',
+                              'index = index + 1; record.index = index; '
+                              f'if index == 1 then {drop} end; '
+                              'if index == 3 then error("lua-mixed-error") end; record.total = 0')
+        page.locator('#demo-config').fill(mixed)
+        output = click_test(page, '#start-demo')
+        records = demo_records(output, require_message=False)
+        assert [record['index'] for record in records] == [2, 4], output
+        assert all(record['message'].endswith(' in the browser') and
+                   record['runtime'] == 'Lua 5.4' and record['total'] == 6 for record in records), output
+        assert output.count('dropping record') == 1 and 'lua-mixed-error' in output, output
     page.locator('#demo-config').fill(example.replace('function enrich(', 'function broken!('))
     click_test(page, '#start-demo', 'failed')
     page.locator('#demo-config').fill(example.replace('call: enrich', 'call: missing'))

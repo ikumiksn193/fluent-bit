@@ -23,6 +23,7 @@
 #include <string.h>
 
 #include <monkey/mk_core.h>
+#include <fluent-bit/flb_socket.h>
 #include <fluent-bit/flb_info.h>
 #include <fluent-bit/flb_mem.h>
 #include <fluent-bit/flb_str.h>
@@ -65,6 +66,30 @@ static void flb_input_rate_gate_timer_cancel(struct flb_input_instance *ins);
 
 struct flb_libco_in_params libco_in_param;
 pthread_key_t libco_in_param_key;
+static pthread_once_t libco_in_param_once = PTHREAD_ONCE_INIT;
+static int libco_in_param_init_result = -1;
+
+static void libco_in_param_key_destroy(void *data)
+{
+    flb_free(data);
+}
+
+static void libco_in_param_key_create()
+{
+    libco_in_param_init_result = pthread_key_create(&libco_in_param_key,
+                                                    libco_in_param_key_destroy);
+}
+
+int flb_input_coro_params_init()
+{
+    int ret;
+
+    ret = pthread_once(&libco_in_param_once, libco_in_param_key_create);
+    if (ret != 0 || libco_in_param_init_result != 0) {
+        return -1;
+    }
+    return 0;
+}
 
 #define protcmp(a, b)  strncasecmp(a, b, strlen(a))
 
@@ -396,6 +421,9 @@ struct flb_input_instance *flb_input_new(struct flb_config *config,
             flb_errno();
             return NULL;
         }
+
+        instance->ch_events[0] = FLB_UNINITIALIZED_SOCKET;
+        instance->ch_events[1] = FLB_UNINITIALIZED_SOCKET;
 
         instance->http_server_config = flb_calloc(1, sizeof(struct flb_http_server_config));
         if (!instance->http_server_config) {
@@ -1155,6 +1183,10 @@ void flb_input_instance_destroy(struct flb_input_instance *ins)
     struct mk_list *head;
     struct flb_input_collector *collector;
 
+    /* Threaded owners already stopped their processors before joining. */
+    if (!flb_input_is_threaded(ins)) {
+        flb_processor_input_stop(ins->processor);
+    }
     flb_input_ingress_destroy(ins);
 
 #ifdef FLB_HAVE_METRICS
@@ -1310,18 +1342,22 @@ void flb_input_instance_destroy(struct flb_input_instance *ins)
 
     if (ins->ch_events[0] > 0) {
         mk_event_closesocket(ins->ch_events[0]);
+        ins->ch_events[0] = FLB_UNINITIALIZED_SOCKET;
     }
 
     if (ins->ch_events[1] > 0) {
         mk_event_closesocket(ins->ch_events[1]);
+        ins->ch_events[1] = FLB_UNINITIALIZED_SOCKET;
     }
 
     if (ins->ingress_queue_channels[0] > 0) {
         mk_event_closesocket(ins->ingress_queue_channels[0]);
+        ins->ingress_queue_channels[0] = FLB_UNINITIALIZED_SOCKET;
     }
 
     if (ins->ingress_queue_channels[1] > 0) {
         mk_event_closesocket(ins->ingress_queue_channels[1]);
+        ins->ingress_queue_channels[1] = FLB_UNINITIALIZED_SOCKET;
     }
 
     /* Collectors */
@@ -1377,10 +1413,10 @@ static int input_instance_channel_events_init(struct flb_input_instance *ins)
     evl = flb_input_event_loop_get(ins);
 
     /* Input event channel: used for co-routines to report return status */
-    ret = mk_event_channel_create(evl,
-                                  &ins->ch_events[0],
-                                  &ins->ch_events[1],
-                                  ins);
+    ret = flb_pipe_event_channel_create(evl,
+                                        &ins->ch_events[0],
+                                        &ins->ch_events[1],
+                                        ins);
     if (ret != 0) {
         flb_error("could not create events channels for '%s'",
                   flb_input_name(ins));
@@ -1392,7 +1428,7 @@ static int input_instance_channel_events_init(struct flb_input_instance *ins)
               ins->ch_events[0], ins->ch_events[1]);
 
     /*
-     * Note: mk_event_channel_create() sets a type = MK_EVENT_NOTIFICATION by
+     * Note: flb_pipe_event_channel_create() sets a type = MK_EVENT_NOTIFICATION by
      * default, we need to overwrite this value so we can do a clean check
      * into the Engine when the event is triggered.
      */
@@ -1575,6 +1611,11 @@ int flb_input_instance_init(struct flb_input_instance *ins,
     struct flb_config *ctx = ins->config;
     struct flb_input_plugin *p = ins->p;
     int tls_session_mode;
+
+    /* Private inputs can be initialized while another input initializes. */
+    if (ins->initialized == FLB_TRUE) {
+        return 0;
+    }
 
     if (ins->log_level == -1 && config->log != NULL) {
         ins->log_level = config->log->level;
@@ -2049,6 +2090,7 @@ int flb_input_instance_init(struct flb_input_instance *ins,
         }
     }
 
+    ins->initialized = FLB_TRUE;
     return 0;
 }
 
@@ -2154,6 +2196,7 @@ void flb_input_instance_exit(struct flb_input_instance *ins,
         return;
     }
 
+    flb_processor_input_stop(ins->processor);
     p = ins->p;
     if (p->cb_exit && ins->context) {
         /* Multi-threaded input plugins use the same function signature for exit callbacks. */
@@ -3034,6 +3077,9 @@ int flb_input_test_pause_resume(struct flb_input_instance *ins, int sleep_second
 
 static void flb_input_ingestion_paused(struct flb_input_instance *ins)
 {
+    if (ins->ingress_queue_enabled == FLB_TRUE && ins->ingress_queue_collector_id >= 0) {
+        flb_input_collector_pause(ins->ingress_queue_collector_id, ins);
+    }
     if (ins->cmt_ingestion_paused != NULL) {
         /* cmetrics */
         cmt_gauge_set(ins->cmt_ingestion_paused, cfl_time_now(), 1,
@@ -3043,6 +3089,9 @@ static void flb_input_ingestion_paused(struct flb_input_instance *ins)
 
 static void flb_input_ingestion_resumed(struct flb_input_instance *ins)
 {
+    if (ins->ingress_queue_enabled == FLB_TRUE && ins->ingress_queue_collector_id >= 0) {
+        flb_input_collector_resume(ins->ingress_queue_collector_id, ins);
+    }
     if (ins->cmt_ingestion_paused != NULL) {
         /* cmetrics */
         cmt_gauge_set(ins->cmt_ingestion_paused, cfl_time_now(), 0,
@@ -3056,10 +3105,10 @@ int flb_input_plugin_pause(struct flb_input_instance *ins)
 
     ret = 0;
 
-    if (ins->p->cb_pause_checked != NULL) {
+    if (ins->context != NULL && ins->p->cb_pause_checked != NULL) {
         ret = ins->p->cb_pause_checked(ins->context, ins->config);
     }
-    else if (ins->p->cb_pause != NULL) {
+    else if (ins->context != NULL && ins->p->cb_pause != NULL) {
         ins->p->cb_pause(ins->context, ins->config);
     }
 
@@ -3076,10 +3125,10 @@ int flb_input_plugin_resume(struct flb_input_instance *ins)
 
     ret = 0;
 
-    if (ins->p->cb_resume_checked != NULL) {
+    if (ins->context != NULL && ins->p->cb_resume_checked != NULL) {
         ret = ins->p->cb_resume_checked(ins->context, ins->config);
     }
-    else if (ins->p->cb_resume != NULL) {
+    else if (ins->context != NULL && ins->p->cb_resume != NULL) {
         ins->p->cb_resume(ins->context, ins->config);
     }
 
@@ -3097,6 +3146,10 @@ int flb_input_pause(struct flb_input_instance *ins)
         (ins->config == NULL || ins->config->is_shutting_down == FLB_FALSE ||
          (ins->flags & FLB_INPUT_SHUTDOWN_FLUSH) == 0)) {
         return -1;
+    }
+
+    if (ins->ingress_queue_enabled == FLB_TRUE && flb_input_is_threaded(ins)) {
+        return flb_input_thread_instance_pause(ins);
     }
 
     /* Pause only if a callback is set and a local context exists */
@@ -3118,6 +3171,9 @@ int flb_input_pause(struct flb_input_instance *ins)
 
 int flb_input_resume(struct flb_input_instance *ins)
 {
+    if (ins->ingress_queue_enabled == FLB_TRUE && flb_input_is_threaded(ins)) {
+        return flb_input_thread_instance_resume(ins);
+    }
     if ((ins->p->cb_resume || ins->p->cb_resume_checked) && ins->context) {
         if (flb_input_is_threaded(ins)) {
             /* signal the thread event loop about the 'resume' operation */

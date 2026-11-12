@@ -17,7 +17,7 @@ set(CMAKE_POLICY_DEFAULT_CMP0069 NEW)
 # Fluent Bit Version
 set(FLB_VERSION_MAJOR  5)
 set(FLB_VERSION_MINOR  2)
-set(FLB_VERSION_PATCH  0)
+set(FLB_VERSION_PATCH  1)
 set(FLB_VERSION_STR "${FLB_VERSION_MAJOR}.${FLB_VERSION_MINOR}.${FLB_VERSION_PATCH}")
 
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
@@ -1495,6 +1495,12 @@ if(FLB_REGEX)
     FLB_DEFINITION_VAL(ONIG_EXTERN "extern")
   endif()
   add_subdirectory(${FLB_PATH_LIB_ONIGMO} EXCLUDE_FROM_ALL)
+  # Establish the budget before any search, without per-context global writes.
+  foreach(onigmo_target onigmo-static onigmo-shared test_match_operation_limit)
+    if(TARGET ${onigmo_target})
+      target_compile_definitions(${onigmo_target} PRIVATE DEFAULT_MATCH_OPERATION_LIMIT=10000000UL)
+    endif()
+  endforeach()
   target_include_directories(onigmo-static INTERFACE ${FLB_PATH_ROOT_SOURCE}/${FLB_PATH_LIB_ONIGMO})
 endif()
 

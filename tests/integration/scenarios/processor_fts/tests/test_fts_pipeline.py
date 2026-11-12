@@ -153,6 +153,8 @@ def test_output_policy_isolated_across_routes_and_retries(tmp_path, filesystem, 
     blocked = {"value": replay}
 
     class Collector(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
         def do_POST(self):
             message = ExportLogsServiceRequest.FromString(self.rfile.read(int(self.headers["Content-Length"])))
             attempts.append(message)
@@ -293,7 +295,7 @@ def test_pooled_batch_commit_rollback_and_retained_values(tmp_path, placement, r
                        for body in bodies)
             assert all(("edited" not in body) if rollback else body["edited"] is True
                        for body in bodies)
-            diagnostics = runner.recent_log()
+            diagnostics = runner.recent_log(*(["cannot construct policy output"] if rollback else []))
             assert "policy failed" not in diagnostics
             assert ("cannot construct policy output" in diagnostics) is rollback
     finally:

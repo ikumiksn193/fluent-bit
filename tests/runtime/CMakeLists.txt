@@ -256,6 +256,7 @@ endif()
 
 # Output Plugins
 if(FLB_IN_LIB)
+  FLB_RT_TEST(1                        "output_throttle_runtime.c")
   FLB_RT_TEST(FLB_OUT_LIB              "core_engine.c")
   FLB_RT_TEST(FLB_OUT_LIB              "core_log.c")
   FLB_RT_TEST(FLB_OUT_LIB              "core_routes.c")
@@ -432,6 +433,10 @@ endforeach()
 
 if(TARGET flb-rt-processor_journald_otel AND FLB_PROCESSOR_OPENTELEMETRY_ENVELOPE)
   target_compile_definitions(flb-rt-processor_journald_otel PRIVATE JOURNALD_TEST_ENVELOPE)
+endif()
+
+if(TEST flb-rt-output_throttle_runtime)
+  set_tests_properties(flb-rt-output_throttle_runtime PROPERTIES TIMEOUT 120)
 endif()
 
 function(flb_runtime_lock_tests resource_name)

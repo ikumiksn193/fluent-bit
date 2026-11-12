@@ -18,6 +18,7 @@
  */
 
 #include <fluent-bit/flb_info.h>
+#include <fluent-bit/flb_utils.h>
 #ifdef FLB_HAVE_LUAJIT
 #include <luajit.h>
 #endif
@@ -32,6 +33,10 @@
 #endif
 
 #include "fts.h"
+#include "fts_state.h"
+#include "fts_window.h"
+#include "fts_crypto_api.h"
+#include "fts_metric_window.h"
 
 /*
  * LuaJIT raises errors by resetting the C stack pointer instead of calling
@@ -161,15 +166,30 @@ static int restricted_require(lua_State *l)
 
 void fts_runtime_destroy(struct fts_runtime *ctx)
 {
+    if (ctx->package_buffer != NULL) {
+        flb_free(ctx->package_buffer);
+        ctx->package_buffer = NULL;
+        ctx->native_bytes -= ctx->package_buffer_size;
+        ctx->package_buffer_size = 0;
+    }
+    fts_metric_window_destroy(ctx);
+    fts_window_runtime_destroy(ctx);
+    fts_state_destroy(ctx->state);
+    ctx->state = NULL;
     fts_undo_commit(ctx);
     flb_free(ctx->undo);
     ctx->undo = NULL;
     ctx->undo_size = 0;
+    flb_free(ctx->resolved_script);
+    ctx->resolved_script = NULL;
 
     if (ctx->vm) {
         flb_luajit_destroy(ctx->vm);
+        /* Finalizer errors can also unwind through LuaJIT's assembly frames. */
+        fts_sanitizer_forget_unwound_frames();
         ctx->vm = NULL;
     }
+    fts_crypto_destroy(ctx);
 }
 
 /*
@@ -236,6 +256,7 @@ static int initialize_policy(lua_State *l)
     int environment;
 
     ctx = lua_touserdata(l, 1);
+    fts_crypto_initialize(l, ctx);
 #if LUA_VERSION_NUM >= 502
     lua_pushglobaltable(l);
     copy_table(l, -1);
@@ -282,6 +303,8 @@ static int initialize_policy(lua_State *l)
     lua_getfield(l, -1, "fluentbit");
     lua_pushvalue(l, -1);
     ctx->module_ref = luaL_ref(l, LUA_REGISTRYINDEX);
+    fts_hash_register(l);
+    fts_crypto_register(l);
 
     /* public helper overrides do not affect the private adapter module */
     copy_table(l, -1);
@@ -307,24 +330,30 @@ static int initialize_policy(lua_State *l)
     lua_pushcclosure(l, policy_collectgarbage, 1);
     lua_setglobal(l, "collectgarbage");
 
-    if (ctx->code) {
-        ret = flb_luajit_load_buffer(ctx->vm, ctx->code, strlen(ctx->code), "fts_policy");
+    if (ctx->recipe) {
+        fts_recipe_initialize(l, ctx);
     }
     else {
-        ret = flb_luajit_load_script(ctx->vm, ctx->script);
-    }
+        if (ctx->code) {
+            ret = flb_luajit_load_buffer(ctx->vm, ctx->code, strlen(ctx->code), "fts_policy");
+        }
+        else {
+            ret = flb_luajit_load_script(ctx->vm,
+                                       ctx->resolved_script ? ctx->resolved_script : ctx->script);
+        }
 
-    if (ret != 0) {
-        return lua_error(l);
-    }
+        if (ret != 0) {
+            return lua_error(l);
+        }
 
-    lua_call(l, 0, 0);
+        lua_call(l, 0, 0);
 
-    lua_getglobal(l, ctx->call);
-    if (!lua_isfunction(l, -1)) {
-        return luaL_error(l, "FTS callback function not found");
+        lua_getglobal(l, ctx->call);
+        if (!lua_isfunction(l, -1)) {
+            return luaL_error(l, "FTS callback function not found");
+        }
+        ctx->policy_ref = luaL_ref(l, LUA_REGISTRYINDEX);
     }
-    ctx->policy_ref = luaL_ref(l, LUA_REGISTRYINDEX);
 
     /* field-name strings are callback upvalues, see fts_getfield() */
     for (i = 0; i < FTS_KEY_COUNT; i++) {
@@ -340,11 +369,30 @@ static int initialize_policy(lua_State *l)
     return 0;
 }
 
+/* Initialize the bounded Lua runtime and the selected signal adapter's helpers. */
 int fts_runtime_initialize(struct fts_runtime *ctx, struct flb_config *config)
 {
     lua_State *l;
     int ret;
+    char path[PATH_MAX + 1];
+    const char *resolved;
 
+    if (ctx->script) {
+        resolved = flb_utils_resolve_config_path(ctx->script, config->conf_path,
+                                                 path, sizeof(path));
+        if (!resolved) {
+            return FLB_PROCESSOR_FAILURE;
+        }
+        if (resolved != ctx->script) {
+            ctx->resolved_script = flb_strdup(resolved);
+            if (!ctx->resolved_script) {
+                return FLB_PROCESSOR_FAILURE;
+            }
+        }
+    }
+
+    ctx->env = config->env;
+    ctx->json_event_ref = LUA_NOREF;
     ctx->vm = flb_luajit_create(config);
     if (!ctx->vm) {
         return FLB_PROCESSOR_FAILURE;
@@ -413,16 +461,24 @@ int fts_runtime_call(struct fts_runtime *ctx, void *data, int results)
     lua_State *l;
     int ret;
     int base;
+    const char *outcome;
 
     l = ctx->vm->state;
     base = lua_gettop(l);
     ctx->instructions_left = ctx->instruction_limit;
+    ctx->recipe_step[0] = '\0';
+    ctx->recipe_error_class = "operation_failed";
 
     lua_rawgeti(l, LUA_REGISTRYINDEX, ctx->callback_ref);
     lua_pushlightuserdata(l, data);
     ret = lua_pcall(l, 1, results, 0);
     if (ret != 0) {
         fts_sanitizer_forget_unwound_frames();
+    }
+    /* Release callback-only roots before error-path garbage collection. */
+    if (ctx->json_event_ref != LUA_NOREF) {
+        lua_pushboolean(l, 0);
+        lua_rawseti(l, LUA_REGISTRYINDEX, ctx->json_event_ref);
     }
     if (ret == 0 && !ctx->jit && ctx->instructions_left <= 0) {
         lua_settop(l, base);
@@ -436,6 +492,25 @@ int fts_runtime_call(struct fts_runtime *ctx, void *data, int results)
         if (!lua_gc(l, LUA_GCISRUNNING, 0)) {
             lua_gc(l, LUA_GCRESTART, -1);
         }
+    }
+
+    if (ctx->recipe) {
+        if (ret == LUA_ERRMEM || (!ctx->jit && ctx->instructions_left <= 0)) {
+            ctx->recipe_error_class = "budget_exceeded";
+        }
+        outcome = "keep";
+        if (ret != 0) {
+            outcome = "error";
+        }
+        else if (lua_type(l, base + 1) == LUA_TSTRING) {
+            if (strcmp(lua_tostring(l, base + 1), "drop") == 0) {
+                outcome = "drop";
+            }
+            else if (strcmp(lua_tostring(l, base + 1), "hold") == 0) {
+                outcome = "hold";
+            }
+        }
+        fts_recipe_count(ctx, outcome);
     }
 
     return ret;

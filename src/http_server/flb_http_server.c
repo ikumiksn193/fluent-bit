@@ -18,13 +18,16 @@
  */
 
 #include <fluent-bit/flb_mem.h>
+#include <fluent-bit/flb_compression.h>
 #include <fluent-bit/flb_input.h>
 #include <fluent-bit/flb_engine.h>
 #include <fluent-bit/flb_network.h>
 #include <fluent-bit/flb_pthread.h>
 #include <fluent-bit/flb_downstream_worker.h>
 #include <fluent-bit/flb_pipe.h>
+#include <fluent-bit/flb_utils.h>
 #include <string.h>
+#include <stdlib.h>
 
 #include <fluent-bit/http_server/flb_http_server.h>
 #include <fluent-bit/http_server/flb_http_server_config_map.h>
@@ -218,6 +221,7 @@ static int flb_http_server_apply_options(struct flb_http_server *session,
     session->idle_timeout = options->idle_timeout;
     session->flags = options->flags;
     session->request_callback = options->request_callback;
+    session->authorization_callback = options->authorization_callback;
     session->user_data = options->user_data;
 
     session->address = options->address;
@@ -230,6 +234,8 @@ static int flb_http_server_apply_options(struct flb_http_server *session,
 
     session->downstream = NULL;
     session->buffer_max_size = options->buffer_max_size;
+    session->max_decoded_body_size = options->max_decoded_body_size;
+    session->http1_max_header_size = options->http1_max_header_size;
     session->buffer_chunk_size = options->buffer_chunk_size;
     session->max_connections = options->max_connections;
     cfl_atomic_store(&session->active_connections, 0);
@@ -427,7 +433,7 @@ static int flb_http_server_should_connection_be_closed(
 }
 
 struct flb_http_server_request_callback_context {
-    struct flb_http_server *server;
+    flb_http_server_request_processor_callback callback;
     struct flb_http_request *request;
     struct flb_http_response *response;
 };
@@ -438,8 +444,7 @@ static int flb_http_server_request_callback_dispatch(void *data)
 
     context = data;
 
-    return context->server->request_callback(context->request,
-                                             context->response);
+    return context->callback(context->request, context->response);
 }
 
 static int flb_http_server_session_is_idle(struct flb_http_server_session *session)
@@ -456,6 +461,31 @@ static int flb_http_server_session_is_idle(struct flb_http_server_session *sessi
 
     /* The HTTP/2 parser can retain an incomplete frame outside these buffers. */
     return FLB_FALSE;
+}
+
+static int flb_http_server_inflate_request(struct flb_http_request *request,
+                                           struct flb_http_response *response)
+{
+    struct flb_http_server_session *session;
+    size_t budget;
+    int result;
+    int status;
+
+    session = request->stream->parent;
+    budget = session->parent->max_decoded_body_size;
+    result = flb_http_request_uncompress_body(request, budget);
+    if (result != 0) {
+        status = 400;
+        if (result == FLB_DECOMPRESSOR_LIMIT_EXCEEDED) {
+            status = 413;
+        }
+        else if (result == FLB_DECOMPRESSOR_ALLOCATION_FAILURE) {
+            status = 503;
+        }
+        flb_http_response_set_status(response, status);
+        flb_http_response_commit(response);
+    }
+    return result;
 }
 
 static int flb_http_server_client_activity_event_handler(void *data)
@@ -527,20 +557,28 @@ static int flb_http_server_client_activity_event_handler(void *data)
             request->content_length = cfl_sds_len(request->body);
         }
 
-        if ((server->flags & FLB_HTTP_SERVER_FLAG_AUTO_INFLATE) != 0) {
-            result = flb_http_request_uncompress_body(request);
-
+        callback_context.request = request;
+        callback_context.response = response;
+        if (server->authorization_callback != NULL) {
+            callback_context.callback = server->authorization_callback;
+            result = flb_downstream_conn_event_call_parent(
+                         connection,
+                         flb_http_server_request_callback_dispatch,
+                         &callback_context);
             if (result != 0) {
-                flb_http_server_session_destroy(session);
+                goto request_complete;
+            }
+        }
 
-                return -1;
+        if ((server->flags & FLB_HTTP_SERVER_FLAG_AUTO_INFLATE) != 0) {
+            result = flb_http_server_inflate_request(request, response);
+            if (result != 0) {
+                goto request_complete;
             }
         }
 
         if (server->request_callback != NULL) {
-            callback_context.server = server;
-            callback_context.request = request;
-            callback_context.response = response;
+            callback_context.callback = server->request_callback;
 
             result = flb_downstream_conn_event_call_parent(
                          connection,
@@ -551,6 +589,7 @@ static int flb_http_server_client_activity_event_handler(void *data)
             /* Report */
         }
 
+request_complete:
         close_connection = flb_http_server_should_connection_be_closed(request);
 
         if (session->version == HTTP_PROTOCOL_VERSION_20) {
@@ -1025,6 +1064,7 @@ static int flb_http_server_worker_initialize(struct flb_downstream_worker *worke
     options.protocol_version = parent->protocol_version;
     options.flags = parent->flags;
     options.request_callback = parent->request_callback;
+    options.authorization_callback = parent->authorization_callback;
     options.user_data = parent->user_data;
     options.address = parent->address;
     options.port = parent->port;
@@ -1035,6 +1075,8 @@ static int flb_http_server_worker_initialize(struct flb_downstream_worker *worke
     options.system_context = parent->system_context;
     options.idle_timeout = parent->idle_timeout;
     options.buffer_max_size = parent->buffer_max_size;
+    options.max_decoded_body_size = parent->max_decoded_body_size;
+    options.http1_max_header_size = parent->http1_max_header_size;
     options.buffer_chunk_size = parent->buffer_chunk_size;
     options.max_connections = parent->max_connections;
     options.connection_counter = parent->connection_counter;
@@ -1220,6 +1262,8 @@ void flb_http_server_options_init(struct flb_http_server_options *options)
     memset(options, 0, sizeof(struct flb_http_server_options));
 
     options->buffer_max_size = HTTP_SERVER_MAXIMUM_BUFFER_SIZE;
+    options->max_decoded_body_size = HTTP_SERVER_DEFAULT_MAX_DECODED_BODY_SIZE;
+    options->http1_max_header_size = HTTP_SERVER_DEFAULT_HTTP1_MAX_HEADER_SIZE;
     options->buffer_chunk_size = HTTP_SERVER_INITIAL_BUFFER_SIZE;
     options->idle_timeout = HTTP_SERVER_DEFAULT_IDLE_TIMEOUT;
     options->max_connections = 0;
@@ -1262,6 +1306,25 @@ int flb_http_server_options_init_from_input(struct flb_http_server_options *opti
     return 0;
 }
 
+/* The binary-size helper accepts numeric prefixes; require a complete value here. */
+static int http_server_header_size_is_valid(const char *value)
+{
+    char *suffix;
+
+    strtod(value, &suffix);
+    if (suffix == value) {
+        return FLB_FALSE;
+    }
+
+    return *suffix == '\0' ||
+           strcasecmp(suffix, "K") == 0 || strcasecmp(suffix, "KB") == 0 ||
+           strcasecmp(suffix, "KiB") == 0 ||
+           strcasecmp(suffix, "M") == 0 || strcasecmp(suffix, "MB") == 0 ||
+           strcasecmp(suffix, "MiB") == 0 ||
+           strcasecmp(suffix, "G") == 0 || strcasecmp(suffix, "GB") == 0 ||
+           strcasecmp(suffix, "GiB") == 0;
+}
+
 int flb_input_http_server_options_init(struct flb_http_server_options *options,
                                        struct flb_input_instance *input_instance,
                                        uint64_t flags,
@@ -1269,6 +1332,7 @@ int flb_input_http_server_options_init(struct flb_http_server_options *options,
                                        void *user_data)
 {
     int protocol_version;
+    int64_t header_limit;
     size_t buffer_max_size;
     int result;
     struct flb_http_server_config *server_config;
@@ -1307,6 +1371,21 @@ int flb_input_http_server_options_init(struct flb_http_server_options *options,
 
     if (server_config != NULL) {
         options->idle_timeout = server_config->idle_timeout;
+        options->max_decoded_body_size = server_config->max_decoded_body_size;
+        if (server_config->http1_max_header_size != NULL) {
+            if (!http_server_header_size_is_valid(server_config->http1_max_header_size)) {
+                flb_error("[http_server] invalid http_server.http1_max_header_size");
+                return -1;
+            }
+            header_limit = flb_utils_size_to_binary_bytes(server_config->http1_max_header_size);
+            if (header_limit < 0 || (uint64_t) header_limit > SIZE_MAX) {
+                flb_error("[http_server] invalid http_server.http1_max_header_size");
+                return -1;
+            }
+            if (header_limit > 0) {
+                options->http1_max_header_size = (size_t) header_limit;
+            }
+        }
         if (server_config->buffer_chunk_size > 0) {
             options->buffer_chunk_size = server_config->buffer_chunk_size;
         }
@@ -1327,6 +1406,18 @@ int flb_http_server_init_with_options(
 
     if (options->buffer_max_size == 0) {
         options->buffer_max_size = HTTP_SERVER_MAXIMUM_BUFFER_SIZE;
+    }
+
+    if (options->max_decoded_body_size == 0) {
+        options->max_decoded_body_size = HTTP_SERVER_DEFAULT_MAX_DECODED_BODY_SIZE;
+    }
+    else if (options->max_decoded_body_size == SIZE_MAX) {
+        flb_error("[http server] invalid http_server.max_decoded_body_size");
+        return -1;
+    }
+
+    if (options->http1_max_header_size == 0) {
+        options->http1_max_header_size = HTTP_SERVER_DEFAULT_HTTP1_MAX_HEADER_SIZE;
     }
 
     if (options->workers <= 0) {

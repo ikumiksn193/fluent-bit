@@ -39,6 +39,89 @@ struct test_backend_ctx {
     int destroy_calls;
 };
 
+/* Private upstream lifetime must not affect engine-owned upstream traversal. */
+void test_upstream_create_thread_safe_is_detached()
+{
+    int i;
+    struct flb_config *config;
+    struct flb_upstream *engine_upstream;
+    struct flb_upstream *worker_upstream;
+
+    config = flb_config_init();
+    TEST_CHECK(config != NULL);
+    if (config == NULL) {
+        return;
+    }
+
+    engine_upstream = flb_upstream_create(config, "127.0.0.1", 80, FLB_IO_TCP, NULL);
+    TEST_CHECK(engine_upstream != NULL);
+    if (engine_upstream == NULL) {
+        flb_config_exit(config);
+        return;
+    }
+
+    for (i = 0; i < 1000; i++) {
+        worker_upstream = flb_upstream_create_thread_safe(config, "127.0.0.1", 80,
+                                                          FLB_IO_TCP, NULL);
+        TEST_CHECK(worker_upstream != NULL);
+        if (worker_upstream == NULL) {
+            break;
+        }
+        TEST_CHECK(flb_stream_is_thread_safe(&worker_upstream->base) == FLB_TRUE);
+        TEST_CHECK(mk_list_entry_orphan(&worker_upstream->base._head) != 0);
+        TEST_CHECK(config->upstreams.next == &engine_upstream->base._head);
+        TEST_CHECK(config->upstreams.prev == &engine_upstream->base._head);
+        flb_upstream_destroy(worker_upstream);
+        TEST_CHECK(config->upstreams.next == &engine_upstream->base._head);
+        TEST_CHECK(config->upstreams.prev == &engine_upstream->base._head);
+    }
+
+    flb_upstream_destroy(engine_upstream);
+    flb_config_exit(config);
+}
+
+void test_upstream_url_tls_scheme(void)
+{
+    int i;
+    struct flb_config *config;
+    struct flb_upstream *upstream;
+    struct flb_tls tls = {0};
+    const char *urls[] = {
+        "https://example.com",
+        "https://example.com:8443"
+    };
+    int ports[] = {443, 8443};
+
+    config = flb_config_init();
+    TEST_CHECK(config != NULL);
+    if (config == NULL) {
+        return;
+    }
+
+    for (i = 0; i < 2; i++) {
+        upstream = flb_upstream_create_url(config, urls[i], FLB_IO_TCP, &tls);
+        TEST_CHECK(upstream != NULL);
+        if (upstream != NULL) {
+            TEST_CHECK(flb_stream_is_secure(&upstream->base) == FLB_TRUE);
+            TEST_CHECK(upstream->tcp_port == ports[i]);
+            flb_upstream_destroy(upstream);
+        }
+
+        upstream = flb_upstream_create_url(config, urls[i], FLB_IO_TCP, NULL);
+        TEST_CHECK(upstream == NULL);
+    }
+
+    upstream = flb_upstream_create_url(config, "http://example.com", FLB_IO_TCP, NULL);
+    TEST_CHECK(upstream != NULL);
+    if (upstream != NULL) {
+        TEST_CHECK(flb_stream_is_secure(&upstream->base) == FLB_FALSE);
+        TEST_CHECK(upstream->tcp_port == 80);
+        flb_upstream_destroy(upstream);
+    }
+
+    flb_config_exit(config);
+}
+
 static int copy_file(const char *src, const char *dst)
 {
     FILE *in;
@@ -1326,6 +1409,8 @@ void test_crl_dispatch_unsupported(void)
 
 TEST_LIST = {
 #ifdef FLB_HAVE_TLS
+    {"upstream_create_thread_safe_is_detached", test_upstream_create_thread_safe_is_detached},
+    {"upstream_url_tls_scheme", test_upstream_url_tls_scheme},
     {"prepare_destroy_conn_marks_tls_session_stale", test_prepare_destroy_conn_marks_tls_session_stale},
     {"tls_session_destroy_no_double_free", test_tls_session_destroy_no_double_free},
     {"upstream_create_https_proxy_sets_tls_context", test_upstream_create_https_proxy_sets_tls_context},

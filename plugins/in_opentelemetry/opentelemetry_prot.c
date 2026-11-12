@@ -727,8 +727,8 @@ static int prepare_grpc_frames(struct flb_opentelemetry *context,
 {
     size_t offset = 0;
     size_t body_size = cfl_sds_len(request->body);
-    size_t remaining = flb_http_server_get_buffer_max_size(&context->http_server);
-    size_t message_limit = 16 * 1024 * 1024;
+    size_t remaining = context->request_max_size;
+    size_t message_limit = context->request_max_size;
     size_t limit;
     size_t size;
     size_t encoding_size;
@@ -819,6 +819,92 @@ error:
     return -1;
 }
 
+int opentelemetry_prot_authorize_ng(struct flb_http_request *request,
+                                     struct flb_http_response *response)
+{
+    struct flb_opentelemetry *context;
+    char *auth_header;
+    size_t auth_len = 0;
+    int grpc_request;
+    int ret;
+
+    context = (struct flb_opentelemetry *) response->stream->user_data;
+    grpc_request = request->path != NULL &&
+                   strncmp(request->path, "/opentelemetry.proto.",
+                           sizeof("/opentelemetry.proto.") - 1) == 0;
+
+    if (context->oauth2_ctx) {
+        auth_header = flb_http_request_get_header(request, "authorization");
+        if (auth_header != NULL) {
+            auth_len = strlen(auth_header);
+        }
+
+        ret = flb_oauth2_jwt_validate(context->oauth2_ctx, auth_header, auth_len);
+        if (ret != FLB_OAUTH2_JWT_OK) {
+            flb_plg_error(context->ins,
+                          "OAuth2 validation failed: %s (rejecting request with 401)",
+                          flb_oauth2_jwt_status_message(ret));
+
+            if (grpc_request) {
+                send_grpc_error_response_ng(response, 16, "unauthorized");
+            }
+            else {
+                send_response_ng(response, 401, NULL);
+            }
+
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/* Validate every frame before ingesting any part of the request. */
+static int validate_protobuf_request(struct flb_opentelemetry *context,
+                                     struct flb_http_request *request,
+                                     struct cfl_list *frames, int grpc_request)
+{
+    const ProtobufCMessageDescriptor *descriptor;
+    struct cfl_list *head;
+    struct otlp_grpc_frame *frame;
+    size_t remaining;
+    int ret;
+
+    if (opentelemetry_is_protobuf_content_type(request->content_type) != FLB_TRUE) {
+        return 0;
+    }
+    if (is_profiles_export_path(request->path)) {
+        descriptor =
+            &opentelemetry__proto__collector__profiles__v1development__export_profiles_service_request__descriptor;
+    }
+    else if (strstr(request->path, "metrics") || strstr(request->path, "metric.v1")) {
+        descriptor =
+            &opentelemetry__proto__collector__metrics__v1__export_metrics_service_request__descriptor;
+    }
+    else if (strstr(request->path, "traces") || strstr(request->path, "trace.v1")) {
+        descriptor =
+            &opentelemetry__proto__collector__trace__v1__export_trace_service_request__descriptor;
+    }
+    else {
+        descriptor =
+            &opentelemetry__proto__collector__logs__v1__export_logs_service_request__descriptor;
+    }
+
+    remaining = context->protobuf_decode_max_size;
+    if (!grpc_request) {
+        return flb_opentelemetry_protobuf_validate_with_budget(
+                descriptor, request->body, cfl_sds_len(request->body), &remaining);
+    }
+    cfl_list_foreach(head, frames) {
+        frame = cfl_list_entry(head, struct otlp_grpc_frame, _head);
+        ret = flb_opentelemetry_protobuf_validate_with_budget(
+                descriptor, frame->payload, frame->size, &remaining);
+        if (ret != 0) {
+            return ret;
+        }
+    }
+    return 0;
+}
+
 /*
  * Protocol handle for requests coming from HTTP/2 server backend. Note that
  * if the payload is compressed (Content-Encoding) it will be decompressed
@@ -831,10 +917,8 @@ int opentelemetry_prot_handle_ng(struct flb_http_request *request,
                                  struct flb_http_response *response)
 {
     int ret = -1;
-    size_t auth_len = 0;
     int grpc_request = FLB_FALSE;
     flb_sds_t tag = NULL;
-    char *auth_header = NULL;
     char payload_type;
     char *payload = NULL;
     size_t payload_size = 0;
@@ -885,29 +969,6 @@ int opentelemetry_prot_handle_ng(struct flb_http_request *request,
         return -1;
     }
 
-    if (context->oauth2_ctx) {
-        auth_header = flb_http_request_get_header(request, "authorization");
-        if (auth_header != NULL) {
-            auth_len = strlen(auth_header);
-        }
-
-        ret = flb_oauth2_jwt_validate(context->oauth2_ctx, auth_header, auth_len);
-        if (ret != FLB_OAUTH2_JWT_OK) {
-            flb_plg_error(context->ins,
-                          "OAuth2 validation failed: %s (rejecting request with 401)",
-                          flb_oauth2_jwt_status_message(ret));
-
-            if (grpc_request) {
-                send_grpc_error_response_ng(response, 16, "unauthorized");
-            }
-            else {
-                send_response_ng(response, 401, NULL);
-            }
-
-            return -1;
-        }
-    }
-
     if (request->method != HTTP_METHOD_POST) {
         if (grpc_request) {
             send_grpc_error_response_ng(response, 3, "invalid HTTP method");
@@ -954,6 +1015,15 @@ int opentelemetry_prot_handle_ng(struct flb_http_request *request,
             return -1;
         }
 
+        ret = validate_protobuf_request(context, request, &frames, FLB_TRUE);
+        if (ret != 0) {
+            destroy_grpc_frames(&frames);
+            send_grpc_error_response_ng(response,
+                    ret == FLB_OTEL_PROTOBUF_LIMIT_EXCEEDED ? 8 : 3,
+                    "protobuf decode budget exceeded or invalid payload");
+            return -1;
+        }
+
 next_grpc_message:
         frame = cfl_list_entry_first(&frames, struct otlp_grpc_frame, _head);
         payload = frame->payload;
@@ -963,6 +1033,17 @@ next_grpc_message:
         grpc_request = FLB_FALSE;
         payload = request->body;
         payload_size = cfl_sds_len(request->body);
+        if (payload_size > context->request_max_size) {
+            send_response_ng(response, 413, "OTLP request size exceeds limit\n");
+            return -1;
+        }
+        ret = validate_protobuf_request(context, request, &frames, FLB_FALSE);
+        if (ret != 0) {
+            send_response_ng(response,
+                    ret == FLB_OTEL_PROTOBUF_LIMIT_EXCEEDED ? 413 : 400,
+                    "protobuf decode budget exceeded or invalid payload\n");
+            return -1;
+        }
     }
 
     if (strcmp(request->path, "/v1/metrics") == 0 ||

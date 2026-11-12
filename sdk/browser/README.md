@@ -11,8 +11,11 @@ Configure Fluent Bit with Emscripten 6.0.9 and `FLB_WASM_BROWSER=ON`,
 `FLB_DEBUG=OFF`, `FLB_RELEASE=OFF`, and `CMAKE_BUILD_TYPE=MinSizeRel`.
 Build target `fluent-bit-runtime`. The complete distributable is in
 `build-wasm-6.0.9-release/sdk/browser/`; copy the entire directory, not only the WASM.
+Browser builds require a separate build directory; in-source configurations are
+rejected to keep generated SDK assets from overwriting source files.
 The CMake install component is `wasm-sdk`. No registry publication is performed.
-The package is deliberately private until the release gates below are met.
+The npm package remains private. Validated archives are published as experimental
+GitHub release assets as described below.
 
 Serve on the application origin over HTTPS (localhost is allowed), with:
 
@@ -69,6 +72,25 @@ same YAML as the demo. A `lib` input is needed only for JavaScript `push()`.
 Write Lua/config assets with `writeFile('/config/script.lua', source)` before
 starting. Filesystem asset operations are rejected while the engine runs.
 
+For interactive runs, create one instance and retain it across runs:
+
+```js
+await fluent.start({yaml, graceSeconds: 0});
+await fluent.push({input: 'application', records});
+await fluent.drain(); // Output callbacks have been invoked; no setTimeout is needed.
+await fluent.stop();  // The module and pthread pool remain warm.
+// Repeat start/push/drain/stop with the next YAML, then destroy on final disposal.
+```
+
+A zero-grace stop checks shutdown immediately instead of waiting for a one-second
+shutdown tick. Call `drain()` first when queued local records must finish.
+The regular engine event loop still runs; there is no scheduler-free batch mode
+or guaranteed runtime in milliseconds. Timers/network retries and buffered
+processors cannot be replaced by a general synchronous pipeline call.
+Configure `FLB_WASM_PTHREAD_POOL_SIZE` (3–16, default 3) at build time if a workload
+needs additional pthreads. CMake sets both the runtime pool and worker limit.
+One or two threads cannot host the current SDK's three concurrent C threads.
+
 ## Lifecycle and delivery contract
 
 - Creation resolves when the command worker and C runtime are ready. `start()`
@@ -83,6 +105,16 @@ starting. Filesystem asset operations are rejected while the engine runs.
   rejected. This is a logs API, not an arbitrary MessagePack/OTLP ingestion API.
 - A partial input write makes the instance unusable: it cannot be replayed safely.
   Queue-full errors mean the command was not sent and may be retried after draining.
+- `drain()` immediately collects pending `lib` pipe data, flushes chunks through
+  the engine, awaits completion of local output tasks, and invokes queued
+  stdout/stderr callbacks before resolving. It does not await promises returned
+  by those callbacks; applications must track their own asynchronous work.
+  It requires exclusively nonthreaded, memory-backed
+  `lib` inputs and `stdout`/`null` outputs; other pipelines reject with
+  `E_UNSUPPORTED`. Filtered/dropped and unmatched records need not produce output.
+  Filter/processor-private buffered records are outside this engine-chunk barrier.
+  Existing bounded log transport can truncate/drop lines; this is not a lossless
+  output collection API. The operation deadline still applies.
 - `stop()` applies the grace configured by `start({graceSeconds})` (default 5,
   maximum 30), releases the engine, and checkpoints persistent storage. Grace
   expiry may drop outstanding data. A successful stop is not an output receipt.
@@ -107,7 +139,7 @@ load/decoding errors are captured from construction and forwarded as runtime
 errors; `[SDK pthread]` diagnostics identify boot, handler readiness, payload
 receipt and completed initialization. Failed initialization cancels streaming
 WASM work and terminates the created pthread workers before reporting failure.
-The four pthread scripts initialize sequentially before the runtime is created;
+The pthread scripts initialize sequentially before the runtime is created;
 the runtime then reuses those workers. This avoids cancelling sibling module
 loads when a script fails, at the cost of serializing their startup latency.
 
@@ -120,7 +152,7 @@ individual lines are truncated at 4096 characters and overload is reported as
 `E_LOG_DROPPED`. Configure Fluent Bit chunk/retry/memory limits too: SDK admission
 limits alone do not bound downstream backlog. WASM growth is capped at 1 GiB;
 worker and JS heap allocations are additional, not included in that cap.
-The SDK caps its pthread pool at four workers and rejects dedicated threaded
+The SDK defaults to three pthread workers (command, engine, logging) and rejects dedicated threaded
 inputs at startup; set `threaded: false`, including for `event_type` inputs.
 
 `await fluent.getStats()` returns an immutable snapshot of lifetime accepted
@@ -184,6 +216,61 @@ unsanitized browser assets, not a production release or an npm publication.
 Artifact availability does not imply the subsequent browser tests or the ASan
 job passed; check the workflow results before choosing a build.
 
+## Published experimental SDKs
+
+After both optimized and ASan jobs pass all CTest, SDK, browser lifecycle,
+startup-fault and demo tests, master pushes publish a GitHub prerelease named
+`wasm-browser-<full-commit>`. Each snapshot has its own tag and assets; it does
+not replace the latest stable Fluent Bit release. PRs and branch pushes only
+produce Actions artifacts. The `fluent-bit-browser-validated-<source-commit>`
+Actions artifact contains the same release payload after the complete matrix
+passes, including a browser test of the extracted archive and FTS ingestion.
+
+The staging release workflow calls this same build after creating a version
+release. The SDK is built from that release tag, not master. Releases that
+predate the browser profile are skipped. Releases published outside the staging
+workflow also trigger the browser workflow. For recovery, dispatch Browser
+WebAssembly with `release_tag` set to an existing version tag such as `v5.2.0`.
+A manual run without a release tag builds/tests without publishing.
+
+A version release provides these files (snapshots use the full commit instead
+of `v5.2.0`):
+
+- `fluent-bit-browser-experimental-v5.2.0.tar.gz`: complete optimized SDK.
+- `fluent-bit-browser-experimental-v5.2.0.tar.gz.sha256`: archive checksum.
+- `fluent-bit-browser-experimental-v5.2.0.json`: source/build commits, toolchain,
+  SDK version, archive SHA-256, and the successful validation run URL.
+
+Existing assets are never overwritten. Publication downloads the assets again
+and compares them with the validated payload; an existing asset with different
+bytes fails verification. The original archive's `build-info.json` describes
+its build-stage checks; the external JSON manifest records the subsequent
+complete matrix validation. Publication copies the exact tested archive bytes.
+
+### Consume from Fluent Bit Studio
+
+Pin an explicit release or snapshot in Studio's deployment pipeline. Download
+and verify the archive there, then serve the extracted SDK on Studio's own
+origin. Do not load workers directly from GitHub or automatically select a
+moving latest version in an open browser session.
+
+```sh
+flb_tag=v5.2.0
+flb_asset="fluent-bit-browser-experimental-$flb_tag"
+gh release download "$flb_tag" --repo fluent/fluent-bit \
+  --pattern "$flb_asset.tar.gz" --pattern "$flb_asset.tar.gz.sha256" \
+  --pattern "$flb_asset.json"
+sha256sum -c "$flb_asset.tar.gz.sha256"
+mkdir -p "public/wasm/$flb_tag"
+tar -xzf "$flb_asset.tar.gz" --strip-components=1 -C "public/wasm/$flb_tag"
+(cd "public/wasm/$flb_tag" && sha256sum -c SHA256SUMS)
+```
+
+Import `/wasm/v5.2.0/fluent-bit.js` in Studio, keeping the runtime, WASM and both
+worker scripts beside it. Preserve the HTTPS, COOP/COEP, MIME and CSP settings
+above. Use immutable caching for the versioned directory. Published archives
+remain experimental and do not imply a production support guarantee.
+
 ## Typed scripting processor
 
 The default browser artifact includes the `fts` processor using portable Lua 5.4.
@@ -203,7 +290,7 @@ Passing Chromium tests alone is not a claim that all these gates are complete.
 
 The Emscripten 6.0.9 migration passes the optimized/ASan SDK and demo suites.
 The Chrome 151 worker-retention failure is covered by repeated startup fault tests
-against the first and fourth workers. Sequential bootstrap alone was insufficient
+against the first and last workers. Sequential bootstrap alone was insufficient
 in later runs. Failed startup now requests cooperative child shutdown before
 terminating the parent, with a 250 ms fallback for an unresponsive child. Optional ASan
 `detect_stack_use_after_return=1` still fails during the SDK's pthread `munmap`

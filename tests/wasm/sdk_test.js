@@ -44,9 +44,10 @@ pipeline:
         logs:
           - name: fts
             script: /config/typed.lua`);
-        await fluent.start({yaml: ftsYaml, graceSeconds: 1});
+        await fluent.start({yaml: ftsYaml.replace('flush: 0.1', 'flush: 60'), graceSeconds: 0});
         await fluent.push({input: 'app', records: [
             {message: 'fts drop'}, {message: 'fts browser', nested: {value: 1}}]});
+        await fluent.drain();
         await waitFor(() => logs.some(line => {
             try {
                 const record = JSON.parse(line);
@@ -55,6 +56,8 @@ pipeline:
             }
             catch (_) { return false; }
         }));
+        await fluent.push({input: 'app', records: [{message: 'fts drop'}]});
+        await fluent.drain();
         await fluent.stop();
         check(!logs.some(line => {
             try { return JSON.parse(line).message === 'fts drop'; }
@@ -89,11 +92,16 @@ pipeline:
               'WASM download byte count');
         check(fluent.state === 'ready' && fluent.info.abi === 1, 'Ready handshake');
         await rejected(() => fluent.push({input: 'app', records: [{message: 'stopped'}]}), 'E_STATE');
+        await rejected(() => fluent.drain(), 'E_STATE');
         await rejected(() => fluent.writeFile('/config/../escape', 'no'), 'E_ARGUMENT');
         await fluent.writeFile('/config/example.lua', 'return "café"');
         check(new TextDecoder().decode(await fluent.readFile('/config/example.lua')) === 'return "café"', 'File roundtrip');
-        for (let round = 0; round < 3; round++) {
-            const result = await fluent.start({yaml, graceSeconds: 1});
+        const timings = [];
+        for (let round = 0; round < 10; round++) {
+            const begin = performance.now();
+            const result = await fluent.start({yaml: yaml.replace('flush: 0.1', 'flush: 60'),
+                                               graceSeconds: 0});
+            await fluent.drain(); // Empty pipelines must complete too.
             check(result.engineMs >= 0 && fluent.state === 'running', 'Engine ready');
             await rejected(() => fluent.start({yaml}), 'E_STATE');
             await rejected(() => fluent.writeFile('/config/active.lua', 'no'), 'E_STATE');
@@ -104,13 +112,78 @@ pipeline:
             const stats = await fluent.getStats();
             check(stats.acceptedRecords === round + 1 && stats.wasmMemoryBytes > 0 &&
                   stats.activeHttpRequests === 0 && Object.isFrozen(stats), 'SDK status snapshot');
-            await waitFor(() => logs.some(line => {
+            await fluent.drain();
+            check(logs.some(line => {
                 try { return JSON.parse(line).message === message; }
                 catch (_) { return false; }
-            }));
+            }), 'Drain waits for output callbacks despite a 60-second flush interval');
             await fluent.stop();
+            timings.push(performance.now() - begin);
             check(fluent.state === 'stopped', 'Stopped');
         }
+        console.log(`Warm start/push/drain/stop milliseconds: ${JSON.stringify(timings)}`);
+        // Count records at the output processor, emitting only eight small
+        // cumulative summaries so the SDK log transport cannot drop the proof.
+        await fluent.writeFile('/config/delivery-count.lua', `local fb = require("fluentbit")
+            local delivered = 0
+            function process(log)
+                delivered = delivered + 1
+                if delivered % 100 ~= 0 then return fb.DROP end
+                log.body:set("message", "large batch delivered")
+                log.body:set("delivered", delivered)
+                return fb.KEEP
+            end`);
+        const largeBatchYaml = yaml.replace('flush: 0.1', 'flush: 60').replace(
+            '      format: json_lines', `      format: json_lines
+      processors:
+        logs:
+          - name: fts
+            script: /config/delivery-count.lua`);
+        await fluent.start({yaml: largeBatchYaml, graceSeconds: 0});
+        for (let batch = 0; batch < 8; batch++) {
+            await fluent.push({input: 'app', records: Array.from({length: 100},
+                (_, index) => ({batch, index, message: 'x'.repeat(8000)}))});
+        }
+        await fluent.drain();
+        const deliveredCounts = logs.flatMap(line => {
+            try {
+                const record = JSON.parse(line);
+                return record.message === 'large batch delivered' ? [record.delivered] : [];
+            }
+            catch (_) { return []; }
+        });
+        check(JSON.stringify(deliveredCounts) === JSON.stringify([100, 200, 300, 400, 500, 600, 700, 800]),
+              'All 800 large records reach output processing before drain resolves');
+        await fluent.stop();
+        const routedYaml = yaml.replace('flush: 0.1', 'flush: 60') + `
+    - name: stdout
+      match: '*'
+      format: json_lines
+`;
+        await fluent.start({yaml: routedYaml, graceSeconds: 0});
+        await fluent.push({input: 'app', records: [{message: 'drain fan-out'}]});
+        await fluent.drain();
+        check(logs.filter(line => {
+            try { return JSON.parse(line).message === 'drain fan-out'; }
+            catch (_) { return false; }
+        }).length === 2, 'Drain waits for both routes');
+        await fluent.stop();
+        await fluent.start({yaml: yaml.replace('flush: 0.1', 'flush: 60').replace("match: '*'",
+            'match: unmatched'), graceSeconds: 0});
+        await fluent.push({input: 'app', records: [{message: 'no matching route'}]});
+        await fluent.drain();
+        check(!logs.some(line => {
+            try { return JSON.parse(line).message === 'no matching route'; }
+            catch (_) { return false; }
+        }), 'Unmatched records must not reach stdout');
+        await fluent.stop();
+        await fluent.start({yaml: yaml.replace('name: lib', 'name: dummy'), graceSeconds: 0});
+        await rejected(() => fluent.drain(), 'E_UNSUPPORTED');
+        await fluent.stop();
+        await fluent.start({yaml: yaml.replace('name: stdout',
+            'name: http\n      host: 127.0.0.1\n      port: 1'), graceSeconds: 0});
+        await rejected(() => fluent.drain(), 'E_UNSUPPORTED');
+        await fluent.stop();
         await rejected(() => fluent.start({yaml: 'pipeline: [invalid]'}), 'E_CONFIG');
         await rejected(() => fluent.start({yaml: yaml.replace('      alias: app',
             '      threaded: true\n      alias: app')}), 'E_CONFIG');

@@ -15,6 +15,7 @@ from utils.test_service import FluentBitTestService
     "modify3", "modify5", "sparse", "sparse_large", "drop", "runtime_error", "syntax_error", "missing_call", "init_error"
 ])
 def test_lua_callbacks(tmp_path, context, mode):
+    """Check callback results and startup failures in both pipeline contexts."""
     args = "tag, timestamp, record"
     result = "2, timestamp, record"
     if mode == "modify5":
@@ -82,8 +83,8 @@ end
             assert not records()
         elif mode == "runtime_error":
             service.wait_for_condition(lambda: "lua-protected-test" in log_text(), timeout=20)
-            output = service.wait_for_condition(records, timeout=20)
-            assert output[0]["message"] == "lua-test"
+            service.stop()
+            assert not records()
         else:
             output = service.wait_for_condition(records, timeout=20)
             values = ["first", None, "third"] if mode == "sparse" else [1, 2, 3]
@@ -91,5 +92,47 @@ end
                 values = {"1000000000": 7}
             assert all(record["message"] == "lua-test café" and record["total"] == 6 and
                        record["values"] == values and record["optional"] is None for record in output)
+    finally:
+        service.stop()
+
+
+@pytest.mark.parametrize("context", ["filter", "processor"])
+def test_script_prefers_config_directory(tmp_path, monkeypatch, context):
+    config_dir = tmp_path / "config"
+    working_dir = tmp_path / "working"
+    config_dir.mkdir()
+    working_dir.mkdir()
+    (config_dir / "policy.lua").write_text(
+        'function enrich(tag, timestamp, record) record.source = "config"; '
+        'return 2, timestamp, record end\n', encoding="utf-8")
+    (working_dir / "policy.lua").write_text(
+        'function enrich(tag, timestamp, record) record.source = "working"; '
+        'return 2, timestamp, record end\n', encoding="utf-8")
+
+    lua_filter = {"name": "lua", "script": "policy.lua", "call": "enrich"}
+    dummy = {"name": "dummy", "tag": "lua.test", "dummy": '{"message":"lua-test"}'}
+    pipeline = {"inputs": [dummy],
+                "outputs": [{"name": "stdout", "match": "*", "format": "json_lines"}]}
+    if context == "processor":
+        dummy["processors"] = {"logs": [lua_filter]}
+    else:
+        lua_filter["match"] = "*"
+        pipeline["filters"] = [lua_filter]
+    config = config_dir / "fluent-bit.yaml"
+    config.write_text(yaml.safe_dump({
+        "service": {"flush": 0.2, "grace": 1, "http_server": True,
+                    "http_port": "${FLUENT_BIT_HTTP_MONITORING_PORT}"},
+        "pipeline": pipeline,
+    }))
+
+    monkeypatch.chdir(working_dir)
+    service = FluentBitTestService(str(config))
+    try:
+        service.start()
+        service.wait_for_condition(
+            lambda: '"source":"config"' in Path(service.flb.log_file).read_text(),
+            timeout=15,
+        )
+        assert '"source":"working"' not in Path(service.flb.log_file).read_text()
     finally:
         service.stop()

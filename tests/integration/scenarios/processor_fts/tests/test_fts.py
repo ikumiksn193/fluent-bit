@@ -11,6 +11,8 @@ import yaml
 from utils.fluent_bit_manager import FluentBitStartupError
 from utils.test_service import FluentBitTestService
 
+from fts_test_utils import read_log
+
 
 def make_service(tmp_path, code, *, grouped=False, error_mode="keep",
                  threaded=False, output_processor=False, second_processor=None, output_format="json_lines", runtime_options=None):
@@ -37,8 +39,8 @@ def make_service(tmp_path, code, *, grouped=False, error_mode="keep",
     return FluentBitTestService(str(config))
 
 
-def log_text(service):
-    return Path(service.flb.log_file).read_text(encoding="utf-8")
+def log_text(service, *expected):
+    return read_log(service.flb.log_file, *expected)
 
 
 def records(service):
@@ -210,7 +212,7 @@ end''' % ('return fb.DROP' if explicit else 'error("drop-on-error")')
         service.stop()
         assert not records(service)
         if not explicit:
-            assert "edits rolled back" in log_text(service)
+            assert "edits rolled back" in log_text(service, "edits rolled back")
     finally:
         service.stop()
 
@@ -221,7 +223,7 @@ def test_startup_failure_cleanup(tmp_path, code):
     try:
         with pytest.raises(FluentBitStartupError):
             service.start()
-        assert "FTS initialization failed" in log_text(service)
+        assert "FTS initialization failed" in log_text(service, "FTS initialization failed")
     finally:
         service.stop()
 
@@ -272,6 +274,31 @@ def test_script_file_and_default_callback(tmp_path):
         service.stop()
 
 
+def test_script_prefers_config_directory(tmp_path, monkeypatch):
+    working_dir = tmp_path / "working"
+    working_dir.mkdir()
+    (tmp_path / "policy.lua").write_text(
+        'function process(log) log.body:set("message", "config") end')
+    (working_dir / "policy.lua").write_text(
+        'function process(log) log.body:set("message", "working") end')
+    service = make_service(tmp_path, "unused")
+    config = tmp_path / "typed.yaml"
+    document = yaml.safe_load(config.read_text())
+    processor = document["pipeline"]["inputs"][0]["processors"]["logs"][0]
+    processor.pop("call")
+    processor.pop("code")
+    processor["script"] = "policy.lua"
+    config.write_text(yaml.safe_dump(document))
+
+    monkeypatch.chdir(working_dir)
+    try:
+        service.start()
+        output = service.wait_for_condition(lambda: records(service), timeout=30)
+        assert all(log["message"] == "config" for log in output)
+    finally:
+        service.stop()
+
+
 @pytest.mark.parametrize("signal", ["profiles"])
 def test_unsupported_signals_fail_startup(tmp_path, signal):
     service = make_service(tmp_path, "function process_log(log) end")
@@ -283,7 +310,7 @@ def test_unsupported_signals_fail_startup(tmp_path, signal):
     try:
         with pytest.raises(FluentBitStartupError):
             service.start()
-        assert "unknown processor 'profiles'" in log_text(service)
+        assert "unknown processor 'profiles'" in log_text(service, "unknown processor 'profiles'")
     finally:
         service.stop()
 
@@ -341,6 +368,6 @@ def test_jit_and_instruction_budget_cannot_be_combined(tmp_path, options):
             service.start()
         expected = ("jit requires instruction_limit=0" if options.get("jit") else
                     "instruction_limit must be between 1000 and 2147483647 with jit disabled")
-        assert expected in log_text(service)
+        assert expected in log_text(service, expected)
     finally:
         service.stop()
